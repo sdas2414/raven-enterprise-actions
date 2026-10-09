@@ -1,0 +1,241 @@
+---
+title: "OneDrive connector"
+sidebarTitle: "OneDrive"
+description: "Sync Microsoft Office documents from OneDrive with scheduled synchronization and business account support"
+icon: "/images/microsoft-icon.svg"
+---
+
+
+Connect OneDrive to automatically sync Word documents, Excel spreadsheets, and PowerPoint presentations into your Supermemory knowledge base. Supports both personal and business accounts with scheduled synchronization.
+
+## Quick setup
+
+### 1. Create OneDrive Connector
+
+<CodeGroup>
+
+```typescript Typescript
+import { Supermemory } from "supermemory"
+
+const supermemory = new Supermemory({ apiKey: process.env.SUPERMEMORY_API_KEY })
+
+const connector = await supermemory.connectors.create("user-123", {
+  provider: "onedrive",
+  redirectUrl: "https://yourapp.com/auth/onedrive/callback"
+  documentLimit: 1500,
+})
+
+// Send the user to Microsoft to authorize
+if (connector.authorization) window.location.href = connector.authorization.url
+// Output: Redirects to https://login.microsoftonline.com/oauth2/authorize?...
+```
+
+```python Python
+from supermemory import Supermemory
+import os
+
+client = Supermemory(api_key=os.environ.get("SUPERMEMORY_API_KEY"))
+
+connector = client.connectors.create(
+    "user-123",
+    request={
+        "provider": "onedrive",
+        "redirectUrl": "https://yourapp.com/auth/onedrive/callback",
+        "documentLimit": 1500,
+    },
+)
+
+# Send the user to Microsoft to authorize
+print(f"Redirect to: {connector.authorization.url}")
+# Output: Redirect to: https://login.microsoftonline.com/oauth2/authorize?...
+```
+
+```bash cURL
+curl -X POST "https://api.supermemory.ai/ns/user-123/connectors" \
+  -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "onedrive",
+    "redirectUrl": "https://yourapp.com/auth/onedrive/callback",
+    "documentLimit": 1500
+  }'
+
+# Response: {
+#   "id": "PTzGiUYei7pgzg5buzZHgA",
+#   "authorization": {
+#     "url": "https://login.microsoftonline.com/oauth2/authorize?...",
+#     "expiresAt": "2024-01-15T11:30:00.000Z"
+#   }
+# }
+```
+
+</CodeGroup>
+
+### 2. Handle Microsoft OAuth
+
+Send the user to `authorization.url` before `authorization.expiresAt`. After the user grants permissions, Microsoft redirects to your `redirectUrl` and the initial sync begins. A pending OAuth connector is not visible in list or get until the user finishes authorization.
+
+### 3. Monitor sync status
+
+<CodeGroup>
+  ```typescript Typescript
+    // Check connector details with recent sync runs
+    const connector = await supermemory.connectors.get("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+      include: "syncs",
+    })
+
+    console.log("Account:", connector.account)
+    console.log("Last sync:", connector.latestRun?.system.status)
+    console.log("Documents synced:", connector.documentCount)
+
+    // List synced Office documents in the namespace
+    const { documents } = await supermemory.list("user-123", "documents")
+    ```
+  ```python Python
+    # Check connector details with recent sync runs
+    connector = client.connectors.get("user-123", "PTzGiUYei7pgzg5buzZHgA", include=["syncs"])
+
+    print(f"Account: {connector.account}")
+    print(f"Last sync: {connector.latest_run.system.status}")
+    print(f"Documents synced: {connector.document_count}")
+
+    # List synced Office documents in the namespace
+    documents = client.list("user-123", "documents").documents
+    ```
+  ```bash cURL
+    # Get connector details with recent sync runs
+    curl "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA?include=syncs" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # List synced Office documents in the namespace
+    curl -X POST "https://api.supermemory.ai/ns/user-123/list/documents" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{}'
+    ```
+</CodeGroup>
+
+<Note>
+There is no per-connector document list in v5. `supermemory.list(namespace, "documents")` returns every document in the namespace.
+</Note>
+
+## Supported document types
+
+### Microsoft Word documents
+- **Rich text formatting** converted to markdown
+- **Headers and styles** preserved as markdown hierarchy
+- **Images and charts** extracted and referenced
+- **Tables** converted to markdown tables
+
+### Excel spreadsheets
+- **Worksheet data** converted to structured markdown
+- **Multiple sheets** processed separately
+- **Charts and graphs** extracted as images
+- **Formulas** converted to calculated values
+- **Cell formatting** simplified in markdown
+
+### PowerPoint presentations
+- **Slide content** converted to structured markdown
+- **Speaker notes** included when present
+- **Images and media** extracted and referenced
+- **Embedded objects** processed when possible
+
+## Sync mechanism
+
+Webhooks lead to real-time syncing of changes in documents. You may also manually trigger a sync.
+
+### Manual sync trigger
+
+The call returns `409` while a sync for that connector is already running.
+
+<CodeGroup>
+  ```typescript Typescript
+    const run = await supermemory.connectors.sync("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    console.log(run.status)
+    // Output: queued
+    ```
+  ```python Python
+    run = client.connectors.sync("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    print(run.status)
+    # Output: queued
+    ```
+  ```bash cURL
+    curl -X POST "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA/sync" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Response: {"id": "PTzGiUYei7pgzg5buzZHgA", "status": "queued"}
+    ```
+</CodeGroup>
+
+## Delete Connector
+
+Remove a OneDrive connector when no longer needed:
+
+<CodeGroup>
+
+```typescript Typescript
+// Delete the connector and its imported documents (default)
+await supermemory.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+// Delete the connector but keep the imported documents
+await supermemory.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+  deleteDocuments: false,
+})
+```
+
+```python Python
+# Delete the connector and its imported documents (default)
+client.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+# Delete the connector but keep the imported documents
+client.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA", delete_documents=False)
+```
+
+```bash cURL
+# Delete the connector and its imported documents (default)
+curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA" \
+  -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+# Delete the connector but keep the imported documents
+curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA?deleteDocuments=false" \
+  -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+```
+
+</CodeGroup>
+
+<Note>
+Deleting a connector will:
+- Stop all future syncs from OneDrive
+- Remove the OAuth authorization
+- Delete the synced documents unless you pass `deleteDocuments: false`
+</Note>
+
+## Advanced configuration
+
+### Custom Microsoft app
+
+For production deployments you can connect with your own Microsoft application. Custom OAuth credentials are an organization setting and are not part of the v5 connector routes. See [Custom OAuth Applications](/connectors/overview#custom-oauth-applications) for the setup steps and callback URL.
+
+### Optimization tips
+
+1. **Set realistic document limits** based on storage and usage
+2. **Monitor sync health** regularly with `latestRun` and `include: "syncs"`
+3. **Trigger manual syncs** when immediate updates are needed
+4. **Consider account type** when setting expectations
+
+<Callout type="info">
+**OneDrive-Specific Benefits:**
+- Supports both personal and business Microsoft accounts
+- Processes all major Office document formats
+- Preserves document structure and formatting
+- Handles large enterprise document collections
+</Callout>
+
+<Warning>
+**Important Limitations:**
+- Large Office documents may take significant time to process
+- Complex Excel formulas may not convert perfectly to markdown
+- Microsoft API rate limits may slow sync for large accounts
+</Warning>

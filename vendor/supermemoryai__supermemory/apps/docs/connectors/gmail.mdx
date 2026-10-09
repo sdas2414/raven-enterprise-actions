@@ -1,0 +1,385 @@
+---
+title: "Gmail connector"
+sidebarTitle: "Gmail"
+description: "Sync email threads from Gmail with real-time Pub/Sub webhooks and incremental sync"
+icon: "/icons/hugeicons/mail-01.svg"
+---
+
+Connect Gmail to automatically sync email threads into your supermemory knowledge base. Supports real-time updates via Google Cloud Pub/Sub webhooks and incremental synchronization.
+
+<Note>
+**Max Plan Required:** The Gmail connector is available on Max plan and above.
+</Note>
+
+## Quick setup
+
+### 1. Create Gmail Connector
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    import { Supermemory } from "supermemory"
+
+    const supermemory = new Supermemory({ apiKey: process.env.SUPERMEMORY_API_KEY })
+
+    const connector = await supermemory.connectors.create("user-123", {
+      provider: "gmail",
+      redirectUrl: "https://yourapp.com/auth/gmail/callback"
+      documentLimit: 5000,
+    })
+
+    // Send the user to Google to authorize
+    if (connector.authorization) window.location.href = connector.authorization.url
+    console.log("Auth URL expires at:", connector.authorization?.expiresAt)
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    from supermemory import Supermemory
+    import os
+
+    client = Supermemory(api_key=os.environ.get("SUPERMEMORY_API_KEY"))
+
+    connector = client.connectors.create(
+        "user-123",
+        request={
+            "provider": "gmail",
+            "redirectUrl": "https://yourapp.com/auth/gmail/callback",
+            "documentLimit": 5000,
+        },
+    )
+
+    # Send the user to Google to authorize
+    print(f"Redirect to: {connector.authorization.url}")
+    print(f"Auth URL expires at: {connector.authorization.expires_at}")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST "https://api.supermemory.ai/ns/user-123/connectors" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "provider": "gmail",
+        "redirectUrl": "https://yourapp.com/auth/gmail/callback",
+        "documentLimit": 5000
+      }'
+
+    # Response: {
+    #   "id": "PTzGiUYei7pgzg5buzZHgA",
+    #   "authorization": {
+    #     "url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+    #     "expiresAt": "2024-01-15T11:30:00.000Z"
+    #   }
+    # }
+    ```
+  </Tab>
+</Tabs>
+
+### 2. Handle OAuth callback
+
+Send the user to `authorization.url` before `authorization.expiresAt`. After the user grants permissions, Google redirects to your `redirectUrl` and the initial sync begins. A pending OAuth connector is not visible in list or get until the user finishes authorization.
+
+### 3. Check Connector Status
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Get connector details with recent sync runs
+    const connector = await supermemory.connectors.get("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+      include: "syncs",
+    })
+
+    console.log("Connected email:", connector.account)
+    console.log("Last sync:", connector.latestRun?.system.status)
+    console.log("Threads synced:", connector.documentCount)
+
+    // List synced email threads in the namespace
+    const docs = await supermemory.list("user-123", "documents")
+
+    console.log(`Synced ${docs.pagination.totalItems} email threads`)
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Get connector details with recent sync runs
+    connector = client.connectors.get("user-123", "PTzGiUYei7pgzg5buzZHgA", include=["syncs"])
+
+    print(f"Connected email: {connector.account}")
+    print(f"Last sync: {connector.latest_run.system.status}")
+    print(f"Threads synced: {connector.document_count}")
+
+    # List synced email threads in the namespace
+    docs = client.list("user-123", "documents")
+
+    print(f"Synced {docs.pagination.total_items} email threads")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Get connector details with recent sync runs
+    curl "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA?include=syncs" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # List synced email threads in the namespace
+    curl -X POST "https://api.supermemory.ai/ns/user-123/list/documents" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{}'
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+There is no per-connector document list in v5. `supermemory.list(namespace, "documents")` returns every document in the namespace.
+</Note>
+
+## What gets synced
+
+### Email threads
+
+Gmail threads (conversations) are synced as individual documents with all messages included:
+
+- **Thread content** converted to structured markdown
+- **All messages** within each thread preserved in order
+- **Message metadata**: subject, from, to, cc, bcc, date
+- **HTML content** converted to clean markdown
+- **Attachment metadata**: filename, mime type, size (attachments are referenced, not stored)
+
+### Document metadata
+
+Each synced thread includes searchable metadata:
+
+| Field | Description |
+|-------|-------------|
+| `type` | Always `gmail_thread` |
+| `subject` | Email subject line |
+| `threadId` | Gmail thread ID |
+| `from` | Sender email address |
+| `to` | Recipient email addresses |
+| `date` | Date of first message |
+| `messageCount` | Number of messages in thread |
+| `attachmentCount` | Number of attachments (if any) |
+| `attachmentNames` | List of attachment filenames |
+
+You can filter searches using these metadata fields:
+
+```typescript
+const results = await supermemory.search("user-123", {
+  query: "project update",
+  filter: {
+    operator: "and",
+    operands: [
+      { field: "type", operator: "eq", value: "gmail_thread" },
+      { field: "from", operator: "eq", value: "team@company.com" },
+    ],
+  },
+  searchMode: "chunks",
+})
+```
+
+## Connector Management
+
+### List All Connectors
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // List all connectors in a namespace
+    const { connectors } = await supermemory.connectors.list("user-123")
+
+    connectors.forEach(connector => {
+      console.log(`Provider: ${connector.provider}`)
+      console.log(`ID: ${connector.id}`)
+      console.log(`Account: ${connector.account}`)
+      console.log(`Created: ${connector.createdAt}`)
+      console.log(`Document limit: ${connector.documentLimit}`)
+      console.log("---")
+    })
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # List all connectors in a namespace
+    connectors = client.connectors.list("user-123").connectors
+
+    for connector in connectors:
+        print(f"Provider: {connector.provider}")
+        print(f"ID: {connector.id}")
+        print(f"Account: {connector.account}")
+        print(f"Created: {connector.created_at}")
+        print(f"Document limit: {connector.document_limit}")
+        print("---")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # List all connectors in a namespace
+    curl "https://api.supermemory.ai/ns/user-123/connectors" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+    ```
+  </Tab>
+</Tabs>
+
+### Delete Connector
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Delete the connector and its imported documents (default)
+    await supermemory.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    // Delete the connector but keep the imported documents
+    await supermemory.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+      deleteDocuments: false,
+    })
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Delete the connector and its imported documents (default)
+    client.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    # Delete the connector but keep the imported documents
+    client.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA", delete_documents=False)
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Delete the connector and its imported documents (default)
+    curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Delete the connector but keep the imported documents
+    curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA?deleteDocuments=false" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+Deleting a connector will:
+- Stop all future syncs from Gmail
+- Remove the OAuth authorization
+- Delete the synced documents unless you pass `deleteDocuments: false`
+</Note>
+
+### Manual sync
+
+Trigger a manual synchronization. The call returns `409` while a sync for that connector is already running.
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    const run = await supermemory.connectors.sync("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    console.log(run.status)
+    // Output: queued
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    run = client.connectors.sync("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    print(run.status)
+    # Output: queued
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA/sync" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Response: {"id": "PTzGiUYei7pgzg5buzZHgA", "status": "queued"}
+    ```
+  </Tab>
+</Tabs>
+
+## Sync mechanism
+
+Gmail connector supports multiple sync methods:
+
+| Feature | Behavior |
+|---------|----------|
+| **Real-time sync** | Via Google Cloud Pub/Sub webhooks (7-day expiry, auto-renewed) |
+| **Scheduled sync** | Every 4 hours |
+| **Manual sync** | On-demand via API |
+| **Incremental sync** | Uses Gmail `historyId` to fetch only changed threads |
+
+### How real-time sync works
+
+1. When a connector is created, supermemory registers a Gmail API "watch" subscription
+2. Gmail sends notifications to a Google Cloud Pub/Sub topic when emails change
+3. supermemory receives these notifications and fetches updated threads
+4. Watch subscriptions expire after 7 days and are automatically renewed
+
+<Note>
+Real-time sync monitors the **INBOX** label. Emails in other labels are synced via scheduled/manual sync.
+</Note>
+
+## Permissions & scopes
+
+The Gmail connector requests the following OAuth scopes:
+
+| Scope | Purpose |
+|-------|---------|
+| `gmail.readonly` | Read-only access to Gmail messages and threads |
+| `userinfo.email` | Access to user's email address for connector identification |
+
+<Warning>
+**Read-only Access:** The Gmail connector only reads emails. It cannot send, delete, or modify any emails in the user's account.
+</Warning>
+
+## Limitations
+
+<Warning>
+**Important Limitations:**
+- **Plan requirement**: Requires Max Plan or above
+- **INBOX only** for real-time sync: Only INBOX label triggers real-time updates; other labels sync via scheduled sync
+- **Watch expiration**: Gmail watch subscriptions expire after 7 days (automatically renewed by supermemory)
+- **Document limit**: Default limit is 10,000 threads per connector (configurable via `documentLimit` parameter)
+- **Attachments**: Attachment metadata is stored, but attachment content is not downloaded
+- **Rate limits**: Gmail API rate limits may affect sync speed for accounts with many emails
+</Warning>
+
+## Troubleshooting
+
+### OAuth fails or missing refresh token
+
+If OAuth fails or the connector stops syncing:
+
+1. Delete the existing connector
+2. Create a new connector
+3. Ensure the user completes the full OAuth flow with consent
+
+```typescript
+// Re-create the connector to get fresh tokens
+await supermemory.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+  deleteDocuments: false,
+})
+
+const next = await supermemory.connectors.create("user-123", {
+  provider: "gmail",
+  redirectUrl: "https://yourapp.com/auth/gmail/callback"
+})
+
+// User must re-authenticate
+if (next.authorization) window.location.href = next.authorization.url
+```
+
+### Emails not syncing in real-time
+
+If real-time sync isn't working:
+
+- Scheduled sync (every 4 hours) and manual sync still work
+- Real-time sync requires supermemory's Pub/Sub infrastructure
+- Check if the connector was created recently (watch registration happens on creation)
+- Trigger a manual sync to verify the connector is working
+
+### Permission denied errors
+
+If you see permission errors:
+
+- Ensure the user granted the required Gmail scopes during OAuth
+- Verify your organization has Max Plan or above access
+- Check if the user revoked app access in their Google Account settings

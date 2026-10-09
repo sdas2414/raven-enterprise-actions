@@ -1,0 +1,338 @@
+---
+title: "CrewAI"
+sidebarTitle: "CrewAI"
+description: "Add persistent memory to CrewAI agents with Supermemory"
+icon: "/icons/hugeicons/user-multiple.svg"
+---
+
+CrewAI agents don't remember anything between runs by default. Supermemory fixes that. You get a memory layer that stores what happened, who the user is, and what they care about. Your crews can pick up where they left off.
+
+## What you can do
+
+- Give agents access to user preferences and past interactions
+- Store crew outputs so future runs can reference them
+- Search memories to give agents relevant context before they start
+
+## Setup
+
+Install the required packages:
+
+```bash
+pip install crewai supermemory python-dotenv
+```
+
+Configure your environment:
+
+```bash
+# .env
+SUPERMEMORY_API_KEY=your-supermemory-api-key
+OPENAI_API_KEY=your-openai-api-key
+```
+
+<Note>Get your Supermemory API key from [console.supermemory.ai](https://console.supermemory.ai).</Note>
+
+## Basic integration
+
+Initialize Supermemory and inject user context into your agent's backstory:
+
+```python
+import os
+from crewai import Agent, Task, Crew, Process
+from supermemory import Supermemory
+from dotenv import load_dotenv
+
+load_dotenv()
+
+memory = Supermemory()
+
+def build_context(user_id: str, query: str) -> str:
+    """Fetch user profile and relevant memories."""
+    profile = memory.profile(user_id).profile
+    memories = memory.search(user_id, query=query, limit=5).results
+
+    static = [m.memory for m in profile.static]
+    dynamic = [m.memory for m in profile.dynamic]
+
+    return f"""
+User Profile:
+{chr(10).join(static) if static else 'No profile data.'}
+
+Current Context:
+{chr(10).join(dynamic) if dynamic else 'No recent activity.'}
+
+Relevant History:
+{chr(10).join([m.memory or m.chunk for m in memories[:5]]) if memories else 'None.'}
+"""
+
+def create_agent_with_memory(user_id: str, role: str, goal: str, query: str) -> Agent:
+    """Create an agent with user context baked into its backstory."""
+    context = build_context(user_id, query)
+
+    return Agent(
+        role=role,
+        goal=goal,
+        backstory=f"""You have access to the following information about the user:
+{context}
+
+Use this context to personalize your work.""",
+        verbose=True
+    )
+```
+
+---
+
+## Core concepts
+
+### User profiles
+
+Supermemory tracks two kinds of user data:
+
+- **Static facts**: Things that don't change often (preferences, job title, tech stack)
+- **Dynamic context**: What the user is working on right now
+
+```python
+result = memory.profile("user_abc")
+
+print([m.memory for m in result.profile.static])   # ["Prefers Agile methodology", "Senior engineer"]
+print([m.memory for m in result.profile.dynamic])  # ["Working on Q2 roadmap", "Focused on API design"]
+```
+
+### Storing memories
+
+Save crew outputs so future runs can reference them:
+
+```python
+def store_crew_result(user_id: str, task_description: str, result: str):
+    """Save crew output as a memory."""
+    memory.add(
+        user_id,
+        content=f"Task: {task_description}\nResult: {result}",
+        metadata={"type": "crew_execution"},
+        dreaming="instant"
+    )
+```
+
+### Searching memories
+
+Pull up past interactions before running a crew:
+
+```python
+results = memory.search(
+    "user_abc",
+    query="previous project recommendations",
+    search_mode="hybrid",  # Searches memories + document chunks
+    limit=10
+)
+
+for r in results.results:
+    print(r.memory or r.chunk)
+```
+
+---
+
+## Example: research crew with memory
+
+This crew has two agents: a researcher and a writer. The researcher adjusts its technical depth based on the user's background. The writer remembers formatting preferences. Both can see what the user has asked about before.
+
+```python
+import os
+from crewai import Agent, Task, Crew, Process
+from crewai_tools import SerperDevTool
+from supermemory import Supermemory
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class ResearchCrew:
+    def __init__(self):
+        self.memory = Supermemory()
+        self.search_tool = SerperDevTool()
+
+    def get_user_context(self, user_id: str, topic: str) -> dict:
+        """Retrieve user profile and related research history."""
+        profile = self.memory.profile(user_id).profile
+        memories = self.memory.search(user_id, query=topic, threshold=0.5).results
+
+        return {
+            "expertise": [m.memory for m in profile.static],
+            "focus": [m.memory for m in profile.dynamic],
+            "history": [m.memory or m.chunk for m in memories[:3]]
+        }
+
+    def create_researcher(self, context: dict) -> Agent:
+        """Build a researcher agent with user context."""
+        expertise_note = ""
+        if context["expertise"]:
+            expertise_note = f"The user has this background: {', '.join(context['expertise'])}. Adjust technical depth accordingly."
+
+        history_note = ""
+        if context["history"]:
+            history_note = f"Previous research on related topics: {'; '.join(context['history'])}"
+
+        return Agent(
+            role="Research Analyst",
+            goal="Conduct research tailored to the user's expertise level",
+            backstory=f"""You research topics and synthesize findings into clear summaries.
+{expertise_note}
+{history_note}""",
+            tools=[self.search_tool],
+            verbose=True
+        )
+
+    def create_writer(self, context: dict) -> Agent:
+        """Build a writer agent that matches user preferences."""
+        style_note = "Write in a clear, technical style."
+        for fact in context.get("expertise", []):
+            if "non-technical" in fact.lower():
+                style_note = "Write in plain language, avoiding jargon."
+                break
+
+        return Agent(
+            role="Content Writer",
+            goal="Transform research into readable content",
+            backstory=f"""You write clear, engaging content. {style_note}""",
+            verbose=True
+        )
+
+    def research(self, user_id: str, topic: str) -> str:
+        """Run the research crew and store results."""
+        context = self.get_user_context(user_id, topic)
+
+        researcher = self.create_researcher(context)
+        writer = self.create_writer(context)
+
+        research_task = Task(
+            description=f"Research the following topic: {topic}",
+            expected_output="Detailed findings with sources",
+            agent=researcher
+        )
+
+        writing_task = Task(
+            description="Write a summary based on the research findings",
+            expected_output="A clear, structured summary",
+            agent=writer
+        )
+
+        crew = Crew(
+            agents=[researcher, writer],
+            tasks=[research_task, writing_task],
+            process=Process.sequential,
+            verbose=True
+        )
+
+        result = crew.kickoff()
+
+        # Store for future sessions
+        self.memory.add(
+            user_id,
+            content=f"Research on '{topic}': {str(result)[:500]}",
+            metadata={"type": "research", "topic": topic},
+            dreaming="instant"
+        )
+
+        return str(result)
+
+
+if __name__ == "__main__":
+    crew = ResearchCrew()
+
+    # Teach preferences
+    crew.memory.add(
+        "researcher_1",
+        content="User prefers concise summaries with bullet points",
+        dreaming="instant"
+    )
+
+    # Run research
+    result = crew.research("researcher_1", "latest developments in AI agents")
+    print(result)
+```
+
+---
+
+## More patterns
+
+### Crews with multiple users
+
+Sometimes you need context from several users at once:
+
+```python
+def create_collaborative_context(user_ids: list[str], topic: str) -> str:
+    """Aggregate context from multiple users."""
+    combined = []
+
+    for user_id in user_ids:
+        static = [m.memory for m in memory.profile(user_id).profile.static]
+        if static:
+            combined.append(f"{user_id}: {', '.join(static[:3])}")
+
+    return "\n".join(combined) if combined else "No shared context available."
+```
+
+### Only storing successful runs
+
+You might not want to save every crew output:
+
+```python
+def store_if_successful(user_id: str, task: str, result: str, success: bool):
+    """Only store successful task completions."""
+    if not success:
+        return
+
+    memory.add(
+        user_id,
+        content=f"Completed: {task}\nOutcome: {result}",
+        metadata={"type": "success", "task": task},
+        dreaming="instant"
+    )
+```
+
+### Using metadata to organize memories
+
+Metadata lets you filter memories by project, agent, or whatever else makes sense:
+
+```python
+# Store with metadata
+memory.add(
+    "user_123",
+    content="Research findings on distributed systems",
+    dreaming="instant",
+    metadata={
+        "project": "infrastructure-review",
+        "agents": ["researcher", "writer"],
+        "confidence": "high"
+    }
+)
+
+# Search with filters
+results = memory.search(
+    "user_123",
+    query="distributed systems",
+    filter={
+        "operator": "and",
+        "operands": [
+            {"field": "project", "operator": "eq", "value": "infrastructure-review"},
+            {"field": "confidence", "operator": "eq", "value": "high"}
+        ]
+    }
+)
+```
+
+---
+
+## Related docs
+
+<CardGroup cols={2}>
+  <Card title="User profiles" icon="/icons/hugeicons/user.svg" href="/recall/user-profiles">
+    How automatic profiling works
+  </Card>
+  <Card title="Search" icon="/icons/hugeicons/search-01.svg" href="/recall/search">
+    Filtering and search modes
+  </Card>
+  <Card title="LangChain" icon="/icons/hugeicons/link-01.svg" href="/integrations/langchain">
+    Memory for LangChain apps
+  </Card>
+  <Card title="Vercel AI SDK" icon="/icons/hugeicons/triangle.svg" href="/integrations/ai-sdk">
+    Memory middleware for Next.js
+  </Card>
+</CardGroup>

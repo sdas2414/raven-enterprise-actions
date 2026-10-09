@@ -1,0 +1,431 @@
+---
+title: "GitHub connector"
+sidebarTitle: "GitHub"
+description: "Connect GitHub repositories to sync documentation files into your Supermemory knowledge base"
+icon: "/images/github-icon.svg"
+---
+
+Connect GitHub repositories to sync documentation files into your Supermemory knowledge base with OAuth authentication, webhook support, and automatic incremental syncing.
+
+<Warning>
+The GitHub connector requires a **Scale Plan** or **Enterprise Plan**.
+</Warning>
+
+## Quick setup
+
+### 1. Create GitHub Connector
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    import { Supermemory } from "supermemory"
+
+    const supermemory = new Supermemory({ apiKey: process.env.SUPERMEMORY_API_KEY })
+
+    const connector = await supermemory.connectors.create("user-123", {
+      provider: "github",
+      redirectUrl: "https://yourapp.com/auth/github/callback"
+      documentLimit: 5000,
+    })
+
+    // Send the user to GitHub to authorize
+    if (connector.authorization) window.location.href = connector.authorization.url
+    console.log("Auth URL expires at:", connector.authorization?.expiresAt)
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    from supermemory import Supermemory
+    import os
+
+    client = Supermemory(api_key=os.environ.get("SUPERMEMORY_API_KEY"))
+
+    connector = client.connectors.create(
+        "user-123",
+        request={
+            "provider": "github",
+            "redirectUrl": "https://yourapp.com/auth/github/callback",
+            "documentLimit": 5000,
+        },
+    )
+
+    # Send the user to GitHub to authorize
+    print(f"Redirect to: {connector.authorization.url}")
+    print(f"Auth URL expires at: {connector.authorization.expires_at}")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST "https://api.supermemory.ai/ns/user-123/connectors" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "provider": "github",
+        "redirectUrl": "https://yourapp.com/auth/github/callback",
+        "documentLimit": 5000
+      }'
+
+    # Response: {
+    #   "id": "PTzGiUYei7pgzg5buzZHgA",
+    #   "authorization": {
+    #     "url": "https://github.com/login/oauth/authorize?...",
+    #     "expiresAt": "2024-01-15T11:30:00.000Z"
+    #   }
+    # }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+**OAuth Scopes:** The GitHub connector requires these scopes:
+- `repo` - Access to private and public repositories
+- `user:email` - Access to user's email address
+- `admin:repo_hook` - Manage webhooks for incremental sync
+</Note>
+
+### 2. Handle OAuth callback
+
+Send the user to `authorization.url` before `authorization.expiresAt`. After the user grants permissions, GitHub redirects to your `redirectUrl`. A pending OAuth connector is not visible in list or get until the user finishes authorization. Once it is visible, the user can select which repositories to sync.
+
+### 3. Select Repositories
+
+Unlike most connectors, GitHub requires repository selection before syncing begins. There are two ways to set it:
+
+- **Hosted picker:** read the connector with `include: "picker"` and send the user to `picker.url`. The link works once and expires at `picker.expiresAt`.
+- **Direct selection:** if you already know the repository ids, pass them in `selection.repos` with `connectors.update`. A new selection replaces the old one and starts a sync.
+
+<Note>
+See [Managing Connector Selection](/connectors/managing-resources) for the generic selection API that GitHub, Gmail and Google Drive share.
+</Note>
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Option A: send the user to the hosted picker
+    const withPicker = await supermemory.connectors.get("user-123", connectorId, {
+      include: "picker",
+      returnUrl: "https://yourapp.com/settings/integrations"
+    })
+
+    if (withPicker.picker) window.location.href = withPicker.picker.url
+
+    // Option B: set the repositories directly by id
+    await supermemory.connectors.update("user-123", connectorId, {
+      selection: {
+        repos: ["123456789", "987654321"],
+      },
+    })
+
+    console.log("Repository sync initiated")
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Option A: send the user to the hosted picker
+    with_picker = client.connectors.get(
+        "user-123",
+        connector_id,
+        include=["picker"],
+        return_url="https://yourapp.com/settings/integrations",
+    )
+
+    if with_picker.picker:
+        print(f"Redirect to: {with_picker.picker.url}")
+
+    # Option B: set the repositories directly by id
+    client.connectors.update(
+        "user-123",
+        connector_id,
+        selection={"repos": ["123456789", "987654321"]},
+    )
+
+    print("Repository sync initiated")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Option A: get a one-time hosted picker URL
+    curl "https://api.supermemory.ai/ns/user-123/connectors/{connectorId}?include=picker&returnUrl=https%3A%2F%2Fyourapp.com%2Fsettings%2Fintegrations" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Response includes: "picker": { "url": "https://...", "expiresAt": "2024-01-15T11:30:00.000Z" }
+
+    # Option B: set the repositories directly by id
+    curl -X PATCH "https://api.supermemory.ai/ns/user-123/connectors/{connectorId}" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "selection": {
+          "repos": ["123456789", "987654321"]
+        }
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+The legacy `GET /v3/connections/{id}/resources` repository listing has no v5 route. The hosted picker shows the user their repositories and saves the selection for you.
+</Note>
+
+## Supported document types
+
+The GitHub connector syncs documentation and text files with the following extensions:
+
+- **Markdown files**: `.md`, `.mdx`, `.markdown`
+- **Text files**: `.txt`
+- **reStructuredText**: `.rst`
+- **AsciiDoc**: `.adoc`
+- **Org-mode**: `.org`
+
+Files are indexed as `github_markdown` document type in Supermemory.
+
+<Note>
+Only text-based documentation files are synced. Binary files, images, and code files (`.js`, `.py`, `.go`, etc.) are excluded by default to focus on searchable documentation content.
+</Note>
+
+## Incremental sync with webhooks
+
+The GitHub connector automatically sets up webhooks for real-time incremental syncing. When files are pushed or deleted in configured repositories, Supermemory is notified immediately.
+
+<Note>
+**Batch Processing:** Webhook events are processed in batches with a 10-minute delay to optimize performance and prevent excessive syncing during rapid commits. This means changes pushed to your repository will be reflected in Supermemory within approximately 10 minutes.
+</Note>
+
+### How it works
+
+1. **Webhook Setup**: When you set the selection, a webhook is automatically installed in each repository
+2. **Push Events**: When commits are pushed to the default branch, changed documentation files are synced
+3. **Delete Events**: When documentation files are deleted, they're removed from your Supermemory knowledge base
+4. **Incremental Updates**: Only changed files are processed, keeping sync fast and efficient
+
+### Webhook security
+
+Webhooks are secured using HMAC-SHA256 signature validation with constant-time comparison. Supermemory automatically validates that webhook events come from GitHub before processing them. Each repository gets a unique webhook secret for maximum security.
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Check sync status and selection
+    const connector = await supermemory.connectors.get("user-123", connectorId, {
+      include: "syncs",
+    })
+
+    console.log("Webhooks:", connector.capabilities.webhooks)
+    console.log("Last synced:", connector.system.lastSuccessfulSyncAt)
+    console.log("Last sync:", connector.latestRun?.system.status, connector.latestRun?.error)
+    console.log("Repositories:", connector.selection?.repos)
+    console.log("Recent runs:", connector.syncs)
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Check sync status and selection
+    connector = client.connectors.get("user-123", connector_id, include=["syncs"])
+
+    print(f"Webhooks: {connector.capabilities.webhooks}")
+    print(f"Last synced: {connector.system.last_successful_sync_at}")
+    print(f"Last sync: {connector.latest_run.system.status} {connector.latest_run.error}")
+    repos = (connector.selection or {}).get("repos") or []
+    print(f"Repositories: {[r.name for r in repos]}")
+    print(f"Recent runs: {connector.syncs}")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Get connector details including recent sync runs
+    curl "https://api.supermemory.ai/ns/user-123/connectors/{connectorId}?include=syncs" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+    ```
+  </Tab>
+</Tabs>
+
+## Connector Management
+
+### List All Connectors
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // List GitHub connectors in a namespace
+    const { connectors } = await supermemory.connectors.list("user-123")
+
+    connectors
+      .filter(connector => connector.provider === "github")
+      .forEach(connector => {
+        console.log(`Provider: ${connector.provider}`)
+        console.log(`ID: ${connector.id}`)
+        console.log(`Account: ${connector.account}`)
+        console.log(`Created: ${connector.createdAt}`)
+        console.log(`Document limit: ${connector.documentLimit}`)
+        console.log(`Repositories: ${connector.selection?.repos?.length ?? 0}`)
+        console.log("---")
+      })
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # List GitHub connectors in a namespace
+    connectors = client.connectors.list("user-123", provider="github").connectors
+
+    for connector in connectors:
+        print(f"Provider: {connector.provider}")
+        print(f"ID: {connector.id}")
+        print(f"Account: {connector.account}")
+        print(f"Created: {connector.created_at}")
+        print(f"Document limit: {connector.document_limit}")
+        repos = (connector.selection or {}).get("repos") or []
+        print(f"Repositories: {len(repos)}")
+        print("---")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # List connectors in a namespace
+    curl "https://api.supermemory.ai/ns/user-123/connectors" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+    ```
+  </Tab>
+</Tabs>
+
+### Update Repository Selection
+
+You can update which repositories are synced at any time. The new selection replaces the old one and starts a sync.
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Add or remove repositories
+    await supermemory.connectors.update("user-123", connectorId, {
+      selection: {
+        repos: ["123456789", "987654321"],
+      },
+    })
+
+    console.log("Repository selection updated")
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Add or remove repositories
+    client.connectors.update(
+        "user-123",
+        connector_id,
+        selection={"repos": ["123456789", "987654321"]},
+    )
+
+    print("Repository selection updated")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Update repository selection
+    curl -X PATCH "https://api.supermemory.ai/ns/user-123/connectors/{connectorId}" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "selection": {
+          "repos": ["123456789", "987654321"]
+        }
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+When you update the repository selection:
+- New repositories are added and synced immediately
+- Removed repositories have their webhooks deleted
+- Existing documents from removed repositories remain in Supermemory unless you delete them manually
+</Note>
+
+### Delete Connector
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Delete the connector and its imported documents (default)
+    await supermemory.connectors.delete("user-123", connectorId)
+
+    // Delete the connector but keep the imported documents
+    await supermemory.connectors.delete("user-123", connectorId, {
+      deleteDocuments: false,
+    })
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Delete the connector and its imported documents (default)
+    client.connectors.delete("user-123", connector_id)
+
+    # Delete the connector but keep the imported documents
+    client.connectors.delete("user-123", connector_id, delete_documents=False)
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Delete the connector and its imported documents (default)
+    curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/{connectorId}" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Delete the connector but keep the imported documents
+    curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/{connectorId}?deleteDocuments=false" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+Deleting a GitHub connector will:
+- Stop all future syncs from configured repositories
+- Remove all webhooks from the repositories
+- Revoke the OAuth authorization
+- **Permanently delete all synced documents** from your Supermemory knowledge base (unless you pass `deleteDocuments: false` to keep them)
+</Warning>
+
+### Manual sync
+
+Trigger a manual synchronization for all selected repositories. The call returns `409` while a sync for that connector is already running.
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    const run = await supermemory.connectors.sync("user-123", connectorId)
+
+    console.log(run.status)
+    // Output: queued
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    run = client.connectors.sync("user-123", connector_id)
+
+    print(run.status)
+    # Output: queued
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST "https://api.supermemory.ai/ns/user-123/connectors/{connectorId}/sync" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Response: {"id": "PTzGiUYei7pgzg5buzZHgA", "status": "queued"}
+    ```
+  </Tab>
+</Tabs>
+
+## Advanced configuration
+
+### Custom OAuth application
+
+For white-label deployments or custom branding you can connect with your own GitHub OAuth app. Custom OAuth credentials are an organization setting and are not part of the v5 connector routes. See [Custom OAuth Applications](/connectors/overview#custom-oauth-applications).
+
+<Note>
+**Setting up a GitHub OAuth App:**
+
+1. Go to GitHub Settings → Developer settings → OAuth Apps
+2. Click "New OAuth App"
+3. Set Authorization callback URL to: `https://api.supermemory.ai/v3/connections/auth/callback/github`
+4. Copy the Client ID and generate a Client Secret
+
+After configuration, all new GitHub connectors will use your custom OAuth app instead of Supermemory's default app.
+</Note>

@@ -1,0 +1,359 @@
+---
+title: "Google Drive connector"
+sidebarTitle: "Google Drive"
+description: "Connect Google Drive to sync documents into your Supermemory knowledge base"
+icon: "/images/google-drive-icon.svg"
+---
+
+Connect Google Drive to sync documents into your Supermemory knowledge base with OAuth authentication and custom app support.
+
+## Sync scope
+
+**Default for new connectors:** after OAuth, the user completes a **folder and file** picker (Google Docs, Sheets, Slides, and PDFs). Only items they select are synced and updated until they change the selection (for example from the Supermemory console).
+
+**Whole Drive:** set `config.syncScope` to `"full"` when creating the connector so the entire Drive syncs without the picker.
+
+**Explicit scoped mode:** set `config.syncScope` to `"selected"` for the picker flow, or rely on the default for new connects.
+
+<Note>
+If you use scoped sync and the user has not finished the picker yet, **scheduled or manual sync may skip that connector** until a selection is saved on the connector.
+</Note>
+
+## Quick setup
+
+### 1. Create Google Drive Connector
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    import { Supermemory } from "supermemory"
+
+    const supermemory = new Supermemory({ apiKey: process.env.SUPERMEMORY_API_KEY })
+
+    const connector = await supermemory.connectors.create("user-123", {
+      provider: "google-drive",
+      redirectUrl: "https://yourapp.com/auth/google-drive/callback"
+      documentLimit: 3000,
+      config: { syncScope: "selected" },
+    })
+
+    // Send the user to Google to authorize
+    if (connector.authorization) window.location.href = connector.authorization.url
+    console.log("Auth URL expires at:", connector.authorization?.expiresAt)
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    from supermemory import Supermemory
+    import os
+
+    client = Supermemory(api_key=os.environ.get("SUPERMEMORY_API_KEY"))
+
+    connector = client.connectors.create(
+        "user-123",
+        request={
+            "provider": "google-drive",
+            "redirectUrl": "https://yourapp.com/auth/google-drive/callback",
+            "documentLimit": 3000,
+            "config": {"syncScope": "selected"},
+        },
+    )
+
+    # Send the user to Google to authorize
+    print(f"Redirect to: {connector.authorization.url}")
+    print(f"Auth URL expires at: {connector.authorization.expires_at}")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST "https://api.supermemory.ai/ns/user-123/connectors" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "provider": "google-drive",
+        "redirectUrl": "https://yourapp.com/auth/google-drive/callback",
+        "documentLimit": 3000,
+        "config": { "syncScope": "selected" }
+      }'
+
+    # Response: {
+    #   "id": "PTzGiUYei7pgzg5buzZHgA",
+    #   "authorization": {
+    #     "url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+    #     "expiresAt": "2024-01-15T11:30:00.000Z"
+    #   }
+    # }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+For **whole Drive** sync, send `"config": { "syncScope": "full" }` on the same `POST /ns/{namespace}/connectors` request instead of `"selected"`.
+</Note>
+
+### 2. Handle OAuth callback
+
+Send the user to `authorization.url` before `authorization.expiresAt`. After the user grants permissions, Google redirects through Supermemory to finish the connector. A pending OAuth connector is not visible in list or get until the user finishes authorization.
+
+With **scoped** sync (`syncScope` omitted or `"selected"`), the user is sent to Supermemory’s **hosted file and folder picker**; they must complete that step before syncs run. With **`syncScope: "full"`**, Supermemory redirects to your `redirectUrl` **without** the picker.
+
+You can open the picker again later for an existing connector. Read the connector with `include: "picker"` and send the user to `picker.url`; the link works once and expires at `picker.expiresAt`. Pass `returnUrl` to choose where the picker sends the user afterwards.
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    const connector = await supermemory.connectors.get("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+      include: "picker",
+      returnUrl: "https://yourapp.com/settings/integrations"
+    })
+
+    if (connector.picker) window.location.href = connector.picker.url
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA?include=picker&returnUrl=https%3A%2F%2Fyourapp.com%2Fsettings%2Fintegrations" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Response includes: "picker": { "url": "https://...", "expiresAt": "2024-01-15T11:30:00.000Z" }
+    ```
+  </Tab>
+</Tabs>
+
+If you already know the Drive file and folder ids, set them directly. A new selection replaces the old one and starts a sync.
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    await supermemory.connectors.update("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+      selection: {
+        files: ["1AbCdEfGhIjKlMnOpQrStUvWxYz"],
+        folders: ["0BxYzAbCdEfGhIjKlMnOpQrStU"],
+      },
+    })
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -X PATCH "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "selection": {
+          "files": ["1AbCdEfGhIjKlMnOpQrStUvWxYz"],
+          "folders": ["0BxYzAbCdEfGhIjKlMnOpQrStU"]
+        }
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+### 3. Check Connector Status
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Get connector details with recent sync runs
+    const connector = await supermemory.connectors.get("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+      include: "syncs",
+    })
+
+    console.log("Account:", connector.account)
+    console.log("Selection:", connector.selection)
+    console.log("Last sync:", connector.latestRun?.system.status)
+
+    // List synced documents in the namespace
+    const { documents } = await supermemory.list("user-123", "documents")
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Get connector details with recent sync runs
+    connector = client.connectors.get("user-123", "PTzGiUYei7pgzg5buzZHgA", include=["syncs"])
+
+    print(f"Account: {connector.account}")
+    print(f"Selection: {connector.selection}")
+    print(f"Last sync: {connector.latest_run.system.status}")
+
+    # List synced documents in the namespace
+    documents = client.list("user-123", "documents").documents
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Get connector details with recent sync runs
+    curl "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA?include=syncs" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # List synced documents in the namespace
+    curl -X POST "https://api.supermemory.ai/ns/user-123/list/documents" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{}'
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+There is no per-connector document list in v5. `supermemory.list(namespace, "documents")` returns every document in the namespace.
+</Note>
+
+## Supported document types
+
+Based on the API type definitions, Google Drive documents are identified with these types:
+- `google_doc` - Google Docs
+- `google_slide` - Google Slides
+- `google_sheet` - Google Sheets
+
+<Note>
+Drive documents are converted to markdown before ingestion. This conversion is lossy — some formatting may not be preserved.
+</Note>
+
+## Connector Management
+
+### List All Connectors
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // List all connectors in a namespace
+    const { connectors } = await supermemory.connectors.list("user-123")
+
+    connectors.forEach(connector => {
+      console.log(`Provider: ${connector.provider}`)
+      console.log(`ID: ${connector.id}`)
+      console.log(`Account: ${connector.account}`)
+      console.log(`Created: ${connector.createdAt}`)
+      console.log(`Document limit: ${connector.documentLimit}`)
+      console.log("---")
+    })
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # List all connectors in a namespace
+    connectors = client.connectors.list("user-123").connectors
+
+    for connector in connectors:
+        print(f"Provider: {connector.provider}")
+        print(f"ID: {connector.id}")
+        print(f"Account: {connector.account}")
+        print(f"Created: {connector.created_at}")
+        print(f"Document limit: {connector.document_limit}")
+        print("---")
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # List all connectors in a namespace
+    curl "https://api.supermemory.ai/ns/user-123/connectors" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Response example:
+    # {
+    #   "connectors": [
+    #     {
+    #       "id": "PTzGiUYei7pgzg5buzZHgA",
+    #       "provider": "google-drive",
+    #       "namespace": "user-123",
+    #       "account": "user@example.com",
+    #       "documentLimit": 3000,
+    #       "documentCount": 120,
+    #       "latestRun": { "system": { "status": "completed", ... }, "error": null },
+    #       "system": { "status": "active", "createdAt": "2024-01-15T10:30:00.000Z", "lastSuccessfulSyncAt": "..." }
+    #     }
+    #   ],
+    #   "pagination": { "currentPage": 1, "limit": 50, "totalItems": 1, "totalPages": 1 }
+    # }
+    ```
+  </Tab>
+</Tabs>
+
+### Delete Connector
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    // Delete the connector and its imported documents (default)
+    await supermemory.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    // Delete the connector but keep the imported documents
+    await supermemory.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA", {
+      deleteDocuments: false,
+    })
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    # Delete the connector and its imported documents (default)
+    client.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    # Delete the connector but keep the imported documents
+    client.connectors.delete("user-123", "PTzGiUYei7pgzg5buzZHgA", delete_documents=False)
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    # Delete the connector and its imported documents (default)
+    curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Delete the connector but keep the imported documents
+    curl -X DELETE "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA?deleteDocuments=false" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+Deleting a connector will:
+- Stop all future syncs from Google Drive
+- Remove the OAuth authorization
+- Delete the synced documents unless you pass `deleteDocuments: false`
+</Note>
+
+### Manual sync
+
+Trigger a manual synchronization. The call returns `409` while a sync for that connector is already running.
+
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    const run = await supermemory.connectors.sync("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    console.log(run.status)
+    // Output: queued
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    run = client.connectors.sync("user-123", "PTzGiUYei7pgzg5buzZHgA")
+
+    print(run.status)
+    # Output: queued
+    ```
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST "https://api.supermemory.ai/ns/user-123/connectors/PTzGiUYei7pgzg5buzZHgA/sync" \
+      -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
+
+    # Response: {"id": "PTzGiUYei7pgzg5buzZHgA", "status": "queued"}
+    ```
+  </Tab>
+</Tabs>
+
+
+
+## Advanced configuration
+
+### Custom OAuth application
+
+You can connect with your own Google OAuth app. Custom OAuth credentials are an organization setting and are not part of the v5 connector routes. See [Custom OAuth Applications](/connectors/overview#custom-oauth-applications) for the setup steps and callback URL.
+
+<Warning>
+**Important Notes:**
+- Document processing happens asynchronously
+- Use one namespace per user or tenant
+- Check `latestRun.system.status` and `latestRun.error` for failed syncs
+</Warning>
