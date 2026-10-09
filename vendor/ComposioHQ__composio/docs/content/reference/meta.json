@@ -1,0 +1,12 @@
+{
+  "title": "Reference",
+  "pages": [
+    "index",
+    "authenticating-to-composio",
+    "errors",
+    "glossary",
+    "api-reference",
+    "v3",
+    "sdk-reference"
+  ]
+}

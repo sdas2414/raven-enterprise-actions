@@ -1,0 +1,338 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { OpenAIAgentsProvider } from '../src';
+import { Tool, ExecuteToolFn } from '@composio/core';
+import { tool as createOpenAIAgentTool } from '@openai/agents';
+
+// Define an interface for our mocked OpenAI Agent tool
+interface MockedOpenAIAgentTool {
+  name: string;
+  description: string;
+  parameters: unknown;
+  execute: Function;
+  _isMockedOpenAIAgentTool: boolean;
+}
+
+// Mock the @openai/agents module
+vi.mock('@openai/agents', () => {
+  return {
+    tool: vi.fn().mockImplementation(toolConfig => {
+      return {
+        ...toolConfig,
+        _isMockedOpenAIAgentTool: true,
+      } as MockedOpenAIAgentTool;
+    }),
+  };
+});
+
+describe('OpenAIAgentsProvider', () => {
+  let provider: OpenAIAgentsProvider;
+  let mockTool: Tool;
+  let mockExecuteToolFn: unknown;
+
+  beforeEach(() => {
+    provider = new OpenAIAgentsProvider();
+
+    // Mock the global execute tool function
+    mockExecuteToolFn = vi.fn().mockResolvedValue({
+      data: { result: 'success' },
+      error: null,
+      successful: true,
+    });
+    provider._setExecuteToolFn(mockExecuteToolFn);
+
+    // Create a mock Composio tool
+    mockTool = {
+      slug: 'test-tool',
+      name: 'Test Tool',
+      description: 'A tool for testing',
+      version: '20250909_00',
+      availableVersions: ['20250909_00', '20250901_00'],
+      inputParameters: {
+        type: 'object',
+        properties: {
+          input: {
+            type: 'string',
+            description: 'Test input',
+          },
+        },
+        required: ['input'],
+      },
+      tags: [],
+    };
+
+    // Reset mocks before each test
+    vi.clearAllMocks();
+  });
+
+  describe('name property', () => {
+    it('should have the correct name', () => {
+      expect(provider.name).toBe('openai-agents');
+    });
+  });
+
+  describe('_isAgentic property', () => {
+    it('should be agentic', () => {
+      expect(provider._isAgentic).toBe(true);
+    });
+  });
+
+  describe('wrapTool', () => {
+    it('should wrap a tool in OpenAI Agent tool format', () => {
+      const wrapped = provider.wrapTool(
+        mockTool,
+        mockExecuteToolFn
+      ) as unknown as MockedOpenAIAgentTool;
+
+      expect(createOpenAIAgentTool).toHaveBeenCalledWith({
+        name: mockTool.slug,
+        description: mockTool.description,
+        parameters: {
+          type: 'object',
+          properties: mockTool.inputParameters?.properties || {},
+          required: mockTool.inputParameters?.required || [],
+          additionalProperties: true,
+        },
+        strict: false,
+        execute: expect.any(Function),
+      });
+
+      expect(wrapped._isMockedOpenAIAgentTool).toBe(true);
+    });
+
+    it('should handle tools without input parameters', () => {
+      const toolWithoutParams: Tool = {
+        ...mockTool,
+        inputParameters: undefined,
+      };
+
+      const wrapped = provider.wrapTool(
+        toolWithoutParams,
+        mockExecuteToolFn
+      ) as unknown as MockedOpenAIAgentTool;
+
+      expect(wrapped._isMockedOpenAIAgentTool).toBe(true);
+    });
+
+    it('deduplicates required entries for directly wrapped tools', () => {
+      provider.wrapTool(
+        {
+          ...mockTool,
+          inputParameters: {
+            ...mockTool.inputParameters!,
+            required: ['input', 'input'],
+          },
+        },
+        mockExecuteToolFn
+      );
+
+      expect(createOpenAIAgentTool).toHaveBeenCalledWith(
+        expect.objectContaining({
+          parameters: expect.objectContaining({ required: ['input'] }),
+        })
+      );
+    });
+
+    it('should normalize a stringified-JSON input to an object before executing (issue #2406)', async () => {
+      const wrapped = provider.wrapTool(
+        mockTool,
+        mockExecuteToolFn
+      ) as unknown as MockedOpenAIAgentTool;
+      const params = { input: 'test-value' };
+
+      await wrapped.execute(params);
+      expect(mockExecuteToolFn).toHaveBeenCalledWith(mockTool.slug, params);
+
+      vi.clearAllMocks();
+      await wrapped.execute(JSON.stringify(params));
+      expect(mockExecuteToolFn).toHaveBeenCalledWith(mockTool.slug, params);
+    });
+
+    it('should throw a typed error for a malformed-JSON string input (issue #2406)', async () => {
+      const wrapped = provider.wrapTool(
+        mockTool,
+        mockExecuteToolFn
+      ) as unknown as MockedOpenAIAgentTool;
+
+      await expect(wrapped.execute('{"input":')).rejects.toThrow(/not valid JSON/);
+    });
+  });
+
+  describe('strict mode', () => {
+    it('registers a strict schema with optional parameters kept as required-nullable', () => {
+      const strictProvider = new OpenAIAgentsProvider({ strict: true });
+      strictProvider._setExecuteToolFn(mockExecuteToolFn);
+      const wrapped = strictProvider.wrapTool(
+        {
+          ...mockTool,
+          inputParameters: {
+            type: 'object',
+            properties: {
+              input: { type: 'string' },
+              cfg: {
+                type: 'object',
+                properties: { url: { type: 'string' }, note: { type: 'string' } },
+                required: ['url'],
+              },
+            },
+            required: ['input'],
+          },
+        },
+        mockExecuteToolFn as ExecuteToolFn
+      ) as unknown as MockedOpenAIAgentTool;
+
+      expect(wrapped.strict).toBe(true);
+      expect(wrapped.parameters).toEqual({
+        type: 'object',
+        properties: {
+          input: { type: 'string' },
+          cfg: {
+            type: ['object', 'null'],
+            properties: { url: { type: 'string' }, note: { type: ['string', 'null'] } },
+            required: ['url', 'note'],
+            additionalProperties: false,
+          },
+        },
+        required: ['input', 'cfg'],
+        additionalProperties: false,
+      });
+    });
+
+    it('registers tools strict mode cannot express without strict', () => {
+      const strictProvider = new OpenAIAgentsProvider({ strict: true });
+      const wrapped = strictProvider.wrapTool(
+        {
+          ...mockTool,
+          inputParameters: {
+            type: 'object',
+            properties: { headers: { type: 'object', additionalProperties: { type: 'string' } } },
+            required: ['headers'],
+          },
+        },
+        mockExecuteToolFn as ExecuteToolFn
+      ) as unknown as MockedOpenAIAgentTool;
+
+      expect(wrapped.strict).toBe(false);
+      expect(wrapped.parameters).toEqual({
+        type: 'object',
+        properties: { headers: { type: 'object', additionalProperties: { type: 'string' } } },
+        required: ['headers'],
+        additionalProperties: true,
+      });
+    });
+
+    it('omits null arguments the tool schema rejects before executing under strict mode', async () => {
+      const strictProvider = new OpenAIAgentsProvider({ strict: true });
+      const wrapped = strictProvider.wrapTool(
+        {
+          ...mockTool,
+          inputParameters: {
+            type: 'object',
+            properties: {
+              input: { type: 'string' },
+              label: { type: 'string' },
+              clearable: { type: ['string', 'null'] },
+            },
+            required: ['input'],
+          },
+        },
+        mockExecuteToolFn as ExecuteToolFn
+      ) as unknown as MockedOpenAIAgentTool;
+
+      await wrapped.execute({ input: 'x', label: null, clearable: null });
+
+      expect(mockExecuteToolFn).toHaveBeenCalledWith(mockTool.slug, {
+        input: 'x',
+        clearable: null,
+      });
+    });
+  });
+
+  describe('wrapTools', () => {
+    it('should wrap multiple tools', () => {
+      const anotherTool: Tool = {
+        ...mockTool,
+        slug: 'another-tool',
+        name: 'Another Tool',
+      };
+      const tools = [mockTool, anotherTool];
+
+      const wrapped = provider.wrapTools(tools, mockExecuteToolFn);
+
+      expect(Array.isArray(wrapped)).toBe(true);
+      expect(wrapped).toHaveLength(2);
+      expect(wrapped[0]).toHaveProperty('name', 'test-tool');
+      expect(wrapped[1]).toHaveProperty('name', 'another-tool');
+
+      // Verify tool was called with the right parameters for each tool
+      expect(createOpenAIAgentTool).toHaveBeenCalledTimes(2);
+      expect(createOpenAIAgentTool).toHaveBeenCalledWith({
+        name: mockTool.slug,
+        description: mockTool.description,
+        parameters: {
+          type: 'object',
+          properties: mockTool.inputParameters?.properties || {},
+          required: mockTool.inputParameters?.required || [],
+          additionalProperties: true,
+        },
+        strict: false,
+        execute: expect.any(Function),
+      });
+      expect(createOpenAIAgentTool).toHaveBeenCalledWith({
+        name: anotherTool.slug,
+        description: anotherTool.description,
+        parameters: {
+          type: 'object',
+          properties: anotherTool.inputParameters?.properties || {},
+          required: anotherTool.inputParameters?.required || [],
+          additionalProperties: true,
+        },
+        strict: false,
+        execute: expect.any(Function),
+      });
+    });
+
+    it('should return an empty array for empty tools array', () => {
+      const wrapped = provider.wrapTools([], mockExecuteToolFn);
+      expect(wrapped).toEqual([]);
+      expect(createOpenAIAgentTool).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('MCP functionality', () => {
+    describe('wrapMcpServerResponse', () => {
+      it('should transform McpUrlResponse to standard McpServerGetResponse format', () => {
+        const mcpResponse = [
+          { name: 'server-1', url: 'https://mcp1.example.com' },
+          { name: 'server-2', url: 'https://mcp2.example.com' },
+          { name: 'server-3', url: 'https://mcp3.example.com' },
+        ];
+
+        const result = provider.wrapMcpServerResponse(mcpResponse);
+
+        expect(Array.isArray(result)).toBe(true);
+        expect(result).toHaveLength(3);
+        expect(result[0]).toEqual({
+          url: new URL('https://mcp1.example.com'),
+          name: 'server-1',
+        });
+        expect(result[1]).toEqual({
+          url: new URL('https://mcp2.example.com'),
+          name: 'server-2',
+        });
+        expect(result[2]).toEqual({
+          url: new URL('https://mcp3.example.com'),
+          name: 'server-3',
+        });
+      });
+
+      it('should handle empty array', () => {
+        const mcpResponse: Array<{ name: string; url: string }> = [];
+
+        const result = provider.wrapMcpServerResponse(mcpResponse);
+
+        expect(Array.isArray(result)).toBe(true);
+        expect(result).toHaveLength(0);
+      });
+    });
+  });
+});

@@ -1,0 +1,70 @@
+import process from 'node:process';
+import { Config, ConfigProvider, Console, Effect, Logger, Layer, References } from 'effect';
+import * as BunServices from '@effect/platform-bun/BunServices';
+import * as BunRuntime from '@effect/platform-bun/BunRuntime';
+import { teardown } from './_shared';
+import path from 'node:path';
+import os from 'node:os';
+import { mkdir } from 'node:fs/promises';
+import { $ } from 'bun';
+import { collectExpectedRunCompanionAssetRelativePaths } from '../src/services/run-companion-modules';
+
+/**
+ * Usage: `COMPOSIO_INSTALL_DIR=<INSTALL_DIR> bun scripts/build-binary.ts <BINARY_PATH>`
+ */
+export function installBinary() {
+  return Effect.gen(function* () {
+    const binaryPath = process.argv[2];
+
+    if (!binaryPath) {
+      return yield* Effect.logError('Missing <BINARY_PATH> argument');
+    }
+
+    const defaultInstallDir = path.join(os.homedir(), '.composio');
+    const installDir = yield* Config.String('COMPOSIO_INSTALL_DIR').pipe(
+      Config.withDefault(defaultInstallDir)
+    );
+
+    yield* Effect.logDebug(`Installing binary in ${installDir}`);
+
+    yield* Effect.tryPromise(() => mkdir(installDir, { recursive: true }));
+    yield* Effect.tryPromise(() => $`cp ${binaryPath} ${installDir}/composio`.quiet());
+
+    const sourceDirectory = path.dirname(path.resolve(binaryPath));
+    const companionRelativePaths =
+      yield* collectExpectedRunCompanionAssetRelativePaths(sourceDirectory);
+
+    for (const relativePath of companionRelativePaths) {
+      const sourcePath = path.join(sourceDirectory, relativePath);
+      const targetPath = path.join(installDir, relativePath);
+      yield* Effect.tryPromise(async () => {
+        if (!(await Bun.file(sourcePath).exists())) {
+          throw new Error(`Missing companion module: ${sourcePath}`);
+        }
+        await $`mkdir -p ${path.dirname(targetPath)}`.quiet();
+        await $`cp ${sourcePath} ${targetPath}`.quiet();
+      });
+    }
+
+    yield* Console.log('Binary successfully installed in', installDir);
+  });
+}
+
+const ConfigLive = Effect.gen(function* () {
+  const logLevel = yield* Config.LogLevel('COMPOSIO_LOG_LEVEL').pipe(Config.withDefault('Info'));
+
+  return Layer.succeed(References.MinimumLogLevel, logLevel);
+}).pipe(Layer.unwrap, Layer.merge(ConfigProvider.layer(ConfigProvider.fromEnv())));
+
+if (require.main === module) {
+  installBinary().pipe(
+    Effect.provide(ConfigLive),
+    Effect.provide(Logger.layer([Logger.consolePretty()])),
+    Effect.provide(BunServices.layer),
+    Effect.scoped,
+    Effect.map(() => ({ message: 'Process completed successfully.' })),
+    BunRuntime.runMain({
+      teardown,
+    })
+  );
+}

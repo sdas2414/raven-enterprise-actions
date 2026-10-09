@@ -1,0 +1,134 @@
+import os from 'node:os';
+import path from 'node:path';
+import { describe, expect, layer } from '@effect/vitest';
+import { Effect } from 'effect';
+import { cli, pkg, TestLive, MockConsole } from 'test/__utils__';
+import { afterEach, vi } from 'vitest';
+
+describe('CLI: composio', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  // v4 migration note: v3's `Command.run` returned a `ValidationError.CommandMismatch` for the
+  // caller to render by hand. `effect/unstable/cli`'s `Command.runWith` renders parse/validation
+  // errors itself (see `src/cli-main.ts` module docs) before re-failing with `CliError.ShowHelp`,
+  // so these tests now assert on the printed `MockConsole` output instead of inspecting the error
+  // value directly.
+  layer(TestLive())(it => {
+    it.effect('[Given] unknown argument [Then] print error message', () =>
+      Effect.gen(function* () {
+        const args = ['--bar'];
+
+        yield* cli(args).pipe(Effect.catch(() => Effect.void));
+        const output = (yield* MockConsole.getLines({ stripAnsi: true })).join('\n');
+
+        expect(output).toContain('--bar');
+        expect(output).toContain('generate');
+        expect(output).toContain('orgs');
+      })
+    );
+  });
+
+  layer(TestLive())(it => {
+    it.effect('[Given] invalid tools subcommand [Then] report tools-scoped mismatch', () =>
+      Effect.gen(function* () {
+        const args = ['tools', 'search', 'metabase', 'put'];
+
+        yield* cli(args).pipe(Effect.catch(() => Effect.void));
+        const output = (yield* MockConsole.getLines({ stripAnsi: true })).join('\n');
+
+        expect(output).toContain('search');
+        expect(output).toContain('info');
+        expect(output).toContain('list');
+      })
+    );
+  });
+
+  layer(TestLive())(it => {
+    it.effect('[Given] no args [Then] prints help message', () =>
+      Effect.gen(function* () {
+        yield* cli([]);
+        const lines = yield* MockConsole.getLines({ stripAnsi: true });
+        const output = lines.join('\n');
+        expect(output).toContain('USAGE');
+        expect(output).toContain('composio');
+        expect(output).not.toContain('composio connections list');
+      })
+    );
+  });
+
+  layer(TestLive())(it => {
+    it.effect('[Given] --help flag [Then] prints help message', () =>
+      Effect.gen(function* () {
+        const args = ['--help'];
+        yield* cli(args);
+        const lines = yield* MockConsole.getLines({ stripAnsi: true });
+        const output = lines.join('\n');
+        expect(output.trim().length).toBeGreaterThan(0);
+        expect(output).toContain('Documentation:');
+        expect(output).not.toContain('connections list');
+      })
+    );
+  });
+
+  layer(TestLive())(it => {
+    it.effect('[Given] --version or -v [Then] prints exactly what `composio version` prints', () =>
+      Effect.gen(function* () {
+        // Each spelling runs against a fresh console so the captured lines are comparable.
+        const linesFor = (args: ReadonlyArray<string>) =>
+          Effect.gen(function* () {
+            yield* cli(args);
+            return yield* MockConsole.getLines({ stream: 'stdout' });
+          }).pipe(Effect.provide(TestLive()));
+
+        const expected = yield* linesFor(['version']);
+        expect(expected.join('\n')).toContain(pkg.version);
+        expect(yield* linesFor(['--version'])).toEqual(expected);
+        expect(yield* linesFor(['-v'])).toEqual(expected);
+      })
+    );
+  });
+
+  layer(TestLive())(it => {
+    it.effect("[Given] a typo'd subcommand [Then] suggests the nearest match", () =>
+      Effect.gen(function* () {
+        const args = ['tols'];
+
+        yield* cli(args).pipe(Effect.catch(() => Effect.void));
+        const output = (yield* MockConsole.getLines({ stripAnsi: true })).join('\n');
+
+        // v4's parser always computes "Did you mean?" suggestions on
+        // `UnknownSubcommand`/`UnrecognizedOption`; Composio deliberately
+        // keeps them (see `cli-config.ts`) instead of stripping them.
+        expect(output).toContain('Did you mean');
+        expect(output).toContain('tools');
+      })
+    );
+  });
+
+  layer(TestLive())(it => {
+    it.effect('[Given] debug who-is-my-master [Then] it prints the detected master as json', () =>
+      Effect.gen(function* () {
+        vi.stubEnv('CODEX_THREAD_ID', 'thread_123');
+        vi.stubEnv('CLAUDE_CODE_ENTRYPOINT', 'sdk-ts');
+
+        yield* cli(['debug', 'who-is-my-master']);
+        const output = (yield* MockConsole.getLines()).join('\n');
+
+        expect(output).toContain('"master": "codex"');
+      })
+    );
+  });
+
+  layer(TestLive())(it => {
+    it.effect('[Given] artifacts cwd [Then] it prints the current session artifact directory', () =>
+      Effect.gen(function* () {
+        yield* cli(['artifacts', 'cwd']);
+        const output = (yield* MockConsole.getLines()).join('\n').trim();
+
+        expect(output).toContain(path.join(os.tmpdir(), 'composio'));
+      })
+    );
+  });
+});

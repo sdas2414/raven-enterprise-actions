@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.options.json",
+  "references": [
+    {
+      "path": "../core"
+    }
+  ],
+  "compilerOptions": {
+    "paths": {
+      "src/*": ["./src/*"],
+      "effect-errors/*": ["./src/effect-errors/*"]
+    },
+    "types": ["@types/bun"]
+  },
+  "include": ["src/**/*", "scripts/**/*.ts", "package.json"],
+  "exclude": ["node_modules", "../../../node_modules", "**/dist", "test/__fixtures__/**"]
+}

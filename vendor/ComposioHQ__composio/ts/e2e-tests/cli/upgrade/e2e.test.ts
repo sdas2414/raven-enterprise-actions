@@ -1,0 +1,136 @@
+/**
+ * CLI upgrade command e2e test
+ *
+ * Verifies that the compiled Linux binary can replace its running executable.
+ */
+
+import { e2e, type E2ETestResult } from '@e2e-tests/utils';
+import { TIMEOUTS } from '@e2e-tests/utils/const';
+import { beforeAll, describe, expect, it } from 'bun:test';
+
+// The "downloaded" bundle is laid out like a release archive: the live companions
+// with their real contents, plus the legacy paths as empty placeholders.
+
+// RUN_COMPANION_MODULE_FILENAMES
+const liveCompanionFileNames = ['run-helpers-runtime.mjs', 'generation-runtime.mjs'] as const;
+
+const runOutputMarker = 'composio-upgrade-run-companions-loaded';
+
+// RUN_COMPANION_LEGACY_PLACEHOLDER_RELATIVE_PATHS
+const legacyPlaceholderRelativePaths = [
+  'run-subagent-shared.mjs',
+  'run-subagent-acp.mjs',
+  'run-subagent-legacy.mjs',
+  'run-subagent-output-mcp.mjs',
+  'acp-adapters/claude-code-acp.mjs',
+  'acp-adapters/cli.js',
+  'acp-adapters/codex/darwin-arm64/codex-acp',
+  'acp-adapters/codex/darwin-x64/codex-acp',
+  'acp-adapters/codex/linux-arm64/codex-acp',
+  'acp-adapters/codex/linux-x64/codex-acp',
+] as const;
+
+const sourceBundleSetup = [
+  'mkdir -p "$source_dir/services"',
+  ...liveCompanionFileNames.flatMap(fileName => [
+    `cp "/usr/local/bin/${fileName}" "$source_dir/${fileName}"`,
+    `cp "/usr/local/bin/services/${fileName}" "$source_dir/services/${fileName}"`,
+  ]),
+  ...legacyPlaceholderRelativePaths.map(
+    relativePath =>
+      `mkdir -p "$(dirname "$source_dir/${relativePath}")"\n: > "$source_dir/${relativePath}"`
+  ),
+].join('\n');
+
+const upgradeCommand = ({
+  executablePath,
+  copyExecutable,
+}: {
+  executablePath: string;
+  copyExecutable: boolean;
+}) => `
+set -u
+executable_path=${executablePath}
+source_dir=/tmp/composio-upgrade-source
+mkdir -p "$source_dir"
+${copyExecutable ? 'mkdir -p "$(dirname "$executable_path")"\ncp /usr/local/bin/composio "$executable_path"' : ''}
+cp /usr/local/bin/composio "$source_dir/composio"
+${sourceBundleSetup}
+
+before_inode=$(stat -c '%i' "$executable_path")
+upgrade_status=0
+DEBUG_OVERRIDE_UPGRADE_TARGET="$source_dir/composio" "$executable_path" upgrade || upgrade_status=$?
+after_inode=$(stat -c '%i' "$executable_path" 2>/dev/null)
+
+if [ -x "$executable_path" ]; then
+  executable_status=0
+else
+  executable_status=1
+fi
+
+version_output=$("$executable_path" version)
+version_status=$?
+run_output=$("$executable_path" run 'console.log(z.string().parse("${runOutputMarker}"))')
+run_status=$?
+printf 'before_inode=%s\nafter_inode=%s\nupgrade_status=%s\nexecutable_status=%s\nversion_status=%s\nversion=%s\nrun_status=%s\nrun_output=%s\n' \
+  "$before_inode" "$after_inode" "$upgrade_status" "$executable_status" "$version_status" "$version_output" "$run_status" "$run_output"
+
+if [ "$upgrade_status" -eq 0 ] &&
+  [ "$executable_status" -eq 0 ] &&
+  [ "$version_status" -eq 0 ] &&
+  [ "$run_status" -eq 0 ] &&
+  [ "$run_output" = "${runOutputMarker}" ] &&
+  [ -n "$before_inode" ] &&
+  [ -n "$after_inode" ] &&
+  [ "$before_inode" != "$after_inode" ]; then
+  exit 0
+fi
+exit 1
+`;
+
+const outputField = (result: E2ETestResult, name: string): string => {
+  const match = result.stdout.match(new RegExp(`^${name}=(.*)$`, 'm'));
+  expect(match).not.toBeNull();
+  return match?.[1] ?? '';
+};
+
+const expectAtomicUpgrade = (result: E2ETestResult) => {
+  expect(result.exitCode).toBe(0);
+  expect(result.stderr).not.toMatch(/ETXTBSY|text[ -]file(?: is)?[ -]busy/i);
+  expect(outputField(result, 'upgrade_status')).toBe('0');
+  expect(outputField(result, 'executable_status')).toBe('0');
+  expect(outputField(result, 'version_status')).toBe('0');
+  expect(outputField(result, 'version')).toMatch(/\d+\.\d+\.\d+/);
+  expect(outputField(result, 'run_status')).toBe('0');
+  expect(outputField(result, 'run_output')).toBe(runOutputMarker);
+  expect(outputField(result, 'after_inode')).not.toBe(outputField(result, 'before_inode'));
+};
+
+e2e(import.meta.url, {
+  versions: {
+    cli: ['current'],
+  },
+  defineTests: ({ runCmd }) => {
+    let installedResult: E2ETestResult;
+    let copiedResult: E2ETestResult;
+
+    beforeAll(async () => {
+      installedResult = await runCmd(
+        upgradeCommand({ executablePath: '/usr/local/bin/composio', copyExecutable: false })
+      );
+      copiedResult = await runCmd(
+        upgradeCommand({ executablePath: '/tmp/composio-copy/composio', copyExecutable: true })
+      );
+    }, TIMEOUTS.FIXTURE);
+
+    describe('composio upgrade', () => {
+      it('replaces the running installed executable', () => {
+        expectAtomicUpgrade(installedResult);
+      });
+
+      it('replaces an executable running from a copied path', () => {
+        expectAtomicUpgrade(copiedResult);
+      });
+    });
+  },
+});

@@ -1,0 +1,619 @@
+"""
+Composio exceptions.
+"""
+
+import difflib
+import typing as t
+
+import typing_extensions as te
+
+from composio_client import ComposioDeprecationWarning as ComposioDeprecationWarning
+
+ENV_COMPOSIO_API_KEY = "COMPOSIO_API_KEY"
+
+
+class ComposioError(Exception):
+    """Base composio SDK error."""
+
+    def __init__(
+        self,
+        message: str,
+        *args: t.Any,
+        delegate: bool = False,
+    ) -> None:
+        """
+        Initialize Composio SDK error.
+
+        :param message: Error message
+        :param delegate: Whether to delegate the error message to the log
+                        collection server or not
+        """
+        super().__init__(message, *args)
+        self.message = message
+        self.delegate = delegate
+
+
+class NotFoundError(ComposioError):
+    pass
+
+
+class HTTPError(ComposioError):
+    """
+    Exception class for HTTP API errors.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int,
+        *args: t.Any,
+        delegate: bool = False,
+    ) -> None:
+        """
+        Initialize HTTPError class.
+
+        :param message: Content from the API response
+        :param status_code: HTTP response status code
+        :param delegate: Whether to delegate the error message to the log
+                        collection server or not
+        """
+        super().__init__(message, *args, delegate=delegate)
+        self.status_code = status_code
+
+
+class ComposioClientError(ComposioError):
+    """
+    Exception class for Composio client errors.
+    """
+
+
+class SDKError(ComposioError):
+    pass
+
+
+class ProcessorError(SDKError):
+    pass
+
+
+class EnumError(ComposioError):
+    pass
+
+
+class ValidationError(ComposioError):
+    pass
+
+
+class JSONSchemaRefResolutionError(ValidationError):
+    """Raised when an internal JSON Schema ``$ref`` cannot be inlined.
+
+    Covers malformed pointers, missing ``$defs``/``definitions`` targets
+    (strict mode only), and ``$ref`` chains or node nesting that exceed the
+    safety caps in :func:`composio.utils.json_schema.dereference_json_schema`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *args: t.Any,
+        meta: t.Optional[t.Dict[str, t.Any]] = None,
+        delegate: bool = False,
+    ) -> None:
+        super().__init__(message, *args, delegate=delegate)
+        self.meta = meta or {}
+
+
+class ToolkitError(ComposioError):
+    pass
+
+
+class EntityIDError(ComposioError):
+    pass
+
+
+class PluginError(ComposioError):
+    pass
+
+
+class InvalidParams(ComposioError):
+    pass
+
+
+class FileError(ComposioError):
+    pass
+
+
+class ComposioSDKTimeoutError(ComposioError, TimeoutError):
+    pass
+
+
+class SDKFileNotFoundError(ComposioError, FileNotFoundError):
+    pass
+
+
+class LockFileError(ComposioError):
+    pass
+
+
+class VersionError(ComposioError):
+    pass
+
+
+class InvalidLockFile(LockFileError):
+    pass
+
+
+class InvalidVersionString(EnumError):
+    pass
+
+
+class VersionSelectionError(LockFileError, VersionError):
+    def __init__(
+        self,
+        action: str,
+        requested: str,
+        locked: str,
+        delegate: bool = False,
+    ) -> None:
+        self.action = action
+        self.requested = requested
+        self.locked = locked
+        super().__init__(
+            message=(
+                f"Error selecting version for action: {action!r}, "
+                f"requested: {requested!r}, locked: {locked!r}"
+            ),
+            delegate=delegate,
+        )
+
+
+class InvalidEnum(EnumError):
+    pass
+
+
+class EnumStringNotFound(EnumError):
+    """Raise when user provides invalid enum string."""
+
+    def __init__(self, value: str, enum: str, possible_values: t.List[str]) -> None:
+        error_message = f"Invalid value `{value}` for enum class `{enum}`"
+        matches = difflib.get_close_matches(value, possible_values, n=1)
+        if matches:
+            (match,) = matches
+            error_message += f". Did you mean {match!r}?"
+
+        super().__init__(message=error_message)
+
+
+class EnumMetadataNotFound(EnumError):
+    pass
+
+
+class ErrorUploadingFile(FileError):
+    pass
+
+
+class BlockedInternalUrlError(FileError):
+    """Raised when a URL file input resolves to a non-public network address."""
+
+
+class SensitiveFilePathBlockedError(FileError):
+    """Raised when a local file path is refused before upload (sensitive directory or credential-like name)."""
+
+
+class FileUploadPathNotAllowedError(FileError):
+    """
+    Raised when automatic file upload during tool execution is attempted from a
+    path outside the configured ``file_upload_dirs`` allowlist.
+
+    Only fires for auto-upload (enabled via
+    ``dangerously_allow_auto_upload_download_files=True``). Manual upload APIs
+    are not subject to this check.
+    """
+
+
+class FileUploadAbortedError(FileError):
+    """Raised when a ``before_file_upload`` hook returns ``False``."""
+
+
+class UnsafePathComponentError(FileError):
+    """
+    Raised when untrusted input (a tool slug, toolkit slug, or server-supplied
+    filename) cannot be safely used as part of a filesystem path.
+
+    Fails closed: the SDK refuses the write rather than sanitizing the value
+    into something that merely looks safe.
+    """
+
+
+class ErrorDownloadingFile(FileError):
+    pass
+
+
+class RemoteFileDownloadError(FileError):
+    """Raised when fetching a remote file from a tool router session mount fails.
+
+    Includes HTTP status, URL, and file path context for debugging.
+    """
+
+    def __init__(
+        self,
+        message: str = "Failed to download remote file",
+        *,
+        status_code: t.Optional[int] = None,
+        status_text: t.Optional[str] = None,
+        download_url: t.Optional[str] = None,
+        mount_relative_path: t.Optional[str] = None,
+        filename: t.Optional[str] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.status_code = status_code
+        self.status_text = status_text
+        self.download_url = download_url
+        self.mount_relative_path = mount_relative_path
+        self.filename = filename
+
+
+class ResponseTooLargeError(FileError):
+    """Raised when a response exceeds the maximum allowed size."""
+
+    pass
+
+
+class TriggerError(ToolkitError):
+    pass
+
+
+class WebhookSignatureVerificationError(TriggerError):
+    """Raised when webhook signature verification fails."""
+
+    pass
+
+
+class WebhookPayloadError(TriggerError):
+    """Raised when webhook payload is invalid."""
+
+    pass
+
+
+class TriggerTypeNotFound(TriggerError, NotFoundError):
+    """Raised when a trigger type cannot be found for the given slug.
+
+    Mirrors the TypeScript SDK's ``ComposioTriggerTypeNotFoundError``.
+    """
+
+    pass
+
+
+class ActionError(ToolkitError):
+    pass
+
+
+class TriggerSubscriptionError(TriggerError, ComposioClientError):
+    pass
+
+
+class InvalidTriggerFilters(TriggerSubscriptionError):
+    pass
+
+
+class TriggerSubscriptionAuthError(TriggerSubscriptionError):
+    """Raised when the realtime channel-auth request fails.
+
+    Covers a transport error, a timeout, a non-200 response, and a response
+    without an ``auth`` token.
+    """
+
+    pass
+
+
+class InvalidPusherClusterError(TriggerSubscriptionError, ValidationError):
+    """Raised when the realtime credentials carry a malformed pusher cluster."""
+
+    pass
+
+
+class ApiKeyError(ComposioClientError):
+    pass
+
+
+class ApiKeyNotProvidedError(ApiKeyError, NotFoundError):
+    """Raise when API key is required but not provided."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            message=(
+                "API Key not provided, either provide API key "
+                f"or export it as `{ENV_COMPOSIO_API_KEY}` "
+                "or run `composio login`"
+            ),
+        )
+
+
+class UserApiKeyNotProvidedError(ApiKeyError):
+    """Raised when the project key is disabled and no user API key is available."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            message=(
+                "`disable_api_key=True` turns off the project API key, but no user "
+                "API key was provided: pass `user_api_key` or export it as "
+                "`COMPOSIO_USER_API_KEY`"
+            )
+        )
+
+
+class MCPDestinationError(ComposioClientError):
+    """Raised when a session's hosted MCP endpoint is not a destination the
+    SDK will hand the session headers to.
+
+    The credential and scope headers are only attached when the MCP URL shares
+    the origin of the API base URL the session was created against. The error
+    is raised only when the caller asked for the endpoint with ``mcp=True``;
+    otherwise the session is returned with empty ``mcp.headers`` and a warning
+    is logged instead. The message names both origins and never includes a
+    credential value.
+    """
+
+    def __init__(self, message: str, *, mcp_origin: str, api_origin: str) -> None:
+        super().__init__(message)
+        self.mcp_origin = mcp_origin
+        self.api_origin = api_origin
+
+
+class SessionConfigConflictError(ComposioClientError):
+    """Raised when a session update is rejected with HTTP 409 because the
+    session configuration changed since it was last read, for example when an
+    ``expected_config_version`` precondition passed to ``update()`` is stale.
+
+    The local session object is left as it was before the call. Re-fetch the
+    session with ``composio.sessions.use(session_id)`` and retry the update
+    against the fresh ``config_version``.
+    """
+
+    status_code = 409
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        session_id: str,
+        expected_config_version: t.Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+        self.expected_config_version = expected_config_version
+
+
+class ToolInputRequest(te.TypedDict):
+    """One question a tool asks the user before it can run."""
+
+    type: str
+    """Kind of input requested, currently ``"elicitation"``."""
+    mode: str
+    """How the client collects the input, currently ``"form"``."""
+    message: str
+    """Message to show the user."""
+    requested_schema: t.Dict[str, t.Any]
+    """JSON Schema for the answer: a flat object with string, number, boolean
+    or enum fields."""
+
+
+class ToolInputRequiredError(ComposioClientError):
+    """Raised when a session tool execution or proxied call did not run
+    because it needs input from the user first, for example an approval. The
+    API answers such a call with ``result_type: "input_required"`` instead of
+    a result.
+
+    ``input_requests`` holds the questions, keyed by the ID the answers must
+    reuse. ``request_state`` is the opaque state the API returned; when present
+    it must be sent back unchanged together with the answers. The SDK does not
+    submit answers yet, so nothing was executed and the call is not retried.
+
+    ``request_state`` is continuation state, so it is kept out of logs: read it
+    as an attribute. ``str()``, ``repr()``, ``args`` and a formatted traceback
+    do not include it.
+    """
+
+    def __init__(
+        self,
+        subject: str,
+        *,
+        input_requests: t.Dict[str, ToolInputRequest],
+        request_state: t.Optional[str] = None,
+    ) -> None:
+        count = len(input_requests)
+        super().__init__(
+            f"{subject} requires user input before it can run "
+            f"({count} input request{'' if count == 1 else 's'}) and was not "
+            "executed. The questions are on `input_requests` and the opaque "
+            "`request_state` to send back with the answers is on `request_state`."
+        )
+        self.input_requests = input_requests
+        self.request_state = request_state
+
+
+class ResourceError(ComposioClientError):
+    pass
+
+
+class NoItemsFound(ResourceError):
+    """
+    Exception class for empty collection values.
+    """
+
+
+class ErrorFetchingResource(ResourceError):
+    pass
+
+
+class SchemaError(ToolkitError):
+    pass
+
+
+class InvalidSchemaError(SchemaError, TypeError):
+    pass
+
+
+class InvalidEntityIdError(EntityIDError, ValueError):
+    pass
+
+
+class IntegrationError(ResourceError):
+    pass
+
+
+class ConnectedAccountError(ResourceError):
+    pass
+
+
+class ConnectedAccountNotFoundError(NotFoundError, ConnectedAccountError):
+    pass
+
+
+class InvalidConnectedAccount(ValidationError, ConnectedAccountError):
+    pass
+
+
+class ComposioMultipleConnectedAccountsError(ConnectedAccountError):
+    """Raised when multiple connected accounts are found for a user and auth config."""
+
+    pass
+
+
+class ComposioLegacyConnectedAccountsEndpointRetiredError(ConnectedAccountError):
+    """Raised by ``composio.connected_accounts.initiate()`` when the legacy
+    ``POST /api/v3/connected_accounts`` endpoint rejects a Composio-managed
+    OAuth (OAuth1, OAuth2, DCR_OAUTH) auth-config request.
+
+    Cutover dates: 2026-05-08 (new orgs), 2026-07-03 (all remaining orgs).
+    Migrate to ``composio.connected_accounts.link()`` — same return shape,
+    works for every redirectable scheme regardless of whether the auth
+    config is Composio-managed or custom.
+
+    See: https://docs.composio.dev/docs/changelog/2026/04/24
+    """
+
+    pass
+
+
+class ComposioConnectedAccountRevocationNotSupportedError(ConnectedAccountError):
+    """Raised by ``composio.connected_accounts.revoke()`` when the toolkit
+    behind the connected account does not support programmatic token
+    revocation (API ``400``).
+
+    Fix: delete or disable the connected account instead, and revoke the
+    grant from the provider's own settings page.
+    """
+
+    pass
+
+
+class ComposioConnectedAccountNotRevokableError(ConnectedAccountError):
+    """Raised by ``composio.connected_accounts.revoke()`` when the connected
+    account is not in a state that can be revoked (API ``409``), for
+    example because it was already revoked or never became ``ACTIVE``.
+    """
+
+    pass
+
+
+class ComposioAclOnlyForSharedError(ConnectedAccountError):
+    """Raised when ACL fields (``allow_all_users``, ``allowed_user_ids``,
+    ``not_allowed_user_ids``) are sent on a ``PRIVATE`` connection. ACL
+    is only meaningful for ``SHARED`` connections.
+
+    Fix: use ``account_type='SHARED'``, or omit the ACL fields when
+    creating/updating a PRIVATE connection.
+    """
+
+    pass
+
+
+class ComposioSharedAccessDeniedError(ConnectedAccountError):
+    """Raised when a tool execution attempts to use a SHARED connected
+    account but the requesting ``user_id`` is not allowed by the
+    connection's ACL.
+
+    Surfaces when a SHARED connection is reached directly (e.g. via
+    ``composio.tools.execute(slug, connected_account_id=...)``) without
+    going through a tool-router session.
+
+    Fix: ask the connection's creator to grant access via
+    ``composio.experimental.update_acl()`` — set ``allow_all_users``,
+    add the ``user_id`` to ``allowed_user_ids``, or remove it from
+    ``not_allowed_user_ids``.
+    """
+
+    pass
+
+
+class ComposioSharedConnectionNotAccessibleError(ConnectedAccountError):
+    """Raised by ``tool_router.session.create()`` / ``session.patch()``
+    when the session's ``user_id`` cannot use a pinned SHARED connection.
+    Raised at session-create time so the session never enters a state
+    that fails mid-execution.
+
+    Fix: grant the session user access via
+    ``composio.experimental.update_acl()`` on the pinned connection,
+    or pin a different connection the user can use.
+    """
+
+    pass
+
+
+class ErrorProcessingToolExecutionRequest(PluginError):
+    pass
+
+
+class DescopeAuthError(ComposioError):
+    pass
+
+
+class DescopeConfigError(ComposioError):
+    pass
+
+
+class InvalidExecuteFunctionError(ComposioError):
+    pass
+
+
+class ToolNotFoundError(NotFoundError):
+    """Raised when a tool slug does not exist.
+
+    Mirrors the TypeScript SDK's ``ComposioToolNotFoundError``. Other failures
+    while fetching a tool (invalid API key, server or network errors) are not
+    translated and surface as the underlying ``composio_client`` error.
+    """
+
+
+class InvalidModifier(ComposioError):
+    pass
+
+
+class ExecuteToolFnNotSetError(ComposioError):
+    pass
+
+
+class ToolVersionRequiredError(ComposioError):
+    """Raised when toolkit version is not specified for manual tool execution."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            message=(
+                "Toolkit version not specified. For manual execution of the tool "
+                "please pass a specific toolkit version.\n\n"
+                "Possible fixes:\n"
+                "1. Pass the toolkit version as a parameter to the execute function "
+                '("latest" is not supported in manual execution)\n'
+                "2. Set the toolkit versions in the Composio config "
+                "(toolkit_versions={'<toolkit-slug>': '<toolkit-version>'})\n"
+                "3. Set the toolkit version in the environment variable "
+                "(COMPOSIO_TOOLKIT_VERSION_<TOOLKIT_SLUG>)\n"
+                "4. Set dangerously_skip_version_check to True "
+                "(this might cause unexpected behavior when new versions of the tools are released)"
+            ),
+        )
+
+
+class UsageError(ComposioError):
+    pass

@@ -1,0 +1,739 @@
+// Companion-module asset resolution and self-repair helpers shared by the CLI runtime,
+// the bundled `composio run` companion modules, and the binary build scripts. Every
+// helper is an Effect over the @effect/platform FileSystem/Path services; consumers
+// outside the CLI runtime (companion runtimes, scripts) provide their own platform layers.
+import * as FileSystem from 'effect/FileSystem';
+import * as Path from 'effect/Path';
+import { Config, ConfigProvider, Data, Effect, Option, PlatformError, Schema } from 'effect';
+import { extractZipSafely } from 'src/utils/extract-zip-safely';
+import { APP_VERSION, IS_RELEASE_BUILD } from 'src/constants';
+import { GitHubRelease } from 'src/effects/resolve-cli-release';
+import { getBaseConfigProvider, extendConfigProvider } from 'src/services/config';
+import { atomicReplaceFile } from 'src/utils/atomic-replace';
+import { parseChecksumsText, sha256Hex } from 'src/utils/checksums';
+import { CLI_RELEASE_TAG_PREFIX } from 'src/utils/cli-release-version';
+
+// Modules the binary build bundles separately (`dist/<name>.mjs` next to the
+// executable) instead of into the executable itself. The first one is what
+// `composio run` preloads into the script it spawns. The last one is loaded into
+// the CLI's own process, on demand, through `loadInstalledCompanionModule`: it
+// carries the TypeScript compiler, which was 44% of the executable's JavaScript
+// and cost every command parse time even though only `generate` and `run`
+// reach it.
+export const RUN_COMPANION_MODULE_BASENAMES: ReadonlyArray<string> = [
+  'run-helpers-runtime',
+  'generation-runtime',
+];
+
+export const RUN_COMPANION_MODULE_FILENAMES = RUN_COMPANION_MODULE_BASENAMES.map(
+  name => `${name}.mjs`
+);
+
+export const RUN_COMPANION_RELEASE_TAG_FILENAME = 'release-tag.txt';
+
+// Paths the removed `experimental_subAgent` helper used to ship. Release archives
+// keep them as zero-byte files because every stable CLI from 0.2.12 to 0.4.2
+// verifies a downloaded upgrade package against its own copy of this list, by
+// existence only, and refuses a package that lacks any of them.
+//
+// Frozen: nothing derives it from live code, so it must not change while those
+// clients can still upgrade. It stays out of `RUN_COMPANION_MODULE_BASENAMES`,
+// which drives the bundler; packaging is the only writer, so installs and source
+// checkouts never require these files.
+// `.github/scripts/cli-release/verify-archive-companions.sh` carries the same list.
+export const RUN_COMPANION_LEGACY_PLACEHOLDER_RELATIVE_PATHS: ReadonlyArray<string> = [
+  'run-subagent-shared.mjs',
+  'run-subagent-acp.mjs',
+  'run-subagent-legacy.mjs',
+  'run-subagent-output-mcp.mjs',
+  'acp-adapters/claude-code-acp.mjs',
+  'acp-adapters/cli.js',
+  'acp-adapters/codex/darwin-arm64/codex-acp',
+  'acp-adapters/codex/darwin-x64/codex-acp',
+  'acp-adapters/codex/linux-arm64/codex-acp',
+  'acp-adapters/codex/linux-x64/codex-acp',
+];
+
+export class RunCompanionRepairError extends Data.TaggedError('services/RunCompanionRepairError')<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+const relativeImportPattern =
+  /(?:import\s+(?:[^'"]+?\s+from\s+)?|export\s+(?:\*\s+from\s+|\{[^}]+\}\s+from\s+)|import\s*\()\s*["'](\.{1,2}\/[^"']+?\.mjs)["']/g;
+
+const isImportGraphFile = (relativePath: string) => /\.(?:m?js|ts)$/.test(relativePath);
+
+const fileExists = (fs: FileSystem.FileSystem, filePath: string) =>
+  fs.exists(filePath).pipe(Effect.orElseSucceed(() => false));
+
+const filePathFromUrl = (path: Path.Path, url: string): Effect.Effect<string> =>
+  Schema.decodeUnknownEffect(Schema.URLFromString)(url).pipe(
+    Effect.flatMap(path.fromFileUrl),
+    Effect.orDie
+  );
+
+const collectRelativeImportPaths = ({
+  fs,
+  path,
+  rootDir,
+  relativePath,
+  collected,
+  recordMissingPaths = false,
+}: {
+  fs: FileSystem.FileSystem;
+  path: Path.Path;
+  rootDir: string;
+  relativePath: string;
+  collected: Set<string>;
+  recordMissingPaths?: boolean;
+}): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const normalizedRelativePath = relativePath.replaceAll(path.sep, '/');
+    if (collected.has(normalizedRelativePath)) {
+      return;
+    }
+
+    const absolutePath = path.join(rootDir, normalizedRelativePath);
+    const exists = yield* fileExists(fs, absolutePath);
+    if (!exists && !recordMissingPaths) {
+      return;
+    }
+
+    collected.add(normalizedRelativePath);
+    if (!exists) {
+      return;
+    }
+
+    if (!isImportGraphFile(normalizedRelativePath)) {
+      return;
+    }
+
+    const source = yield* Effect.orDie(fs.readFileString(absolutePath, 'utf8'));
+    for (const match of source.matchAll(relativeImportPattern)) {
+      const specifier = match[1];
+      if (!specifier) {
+        continue;
+      }
+
+      const dependencyRelativePath = path
+        .relative(rootDir, path.resolve(path.dirname(absolutePath), specifier))
+        .replaceAll(path.sep, '/');
+
+      yield* collectRelativeImportPaths({
+        fs,
+        path,
+        rootDir,
+        relativePath: dependencyRelativePath,
+        collected,
+        recordMissingPaths,
+      });
+    }
+  });
+
+/**
+ * Relative paths an install rooted at `rootDir` is expected to contain: the
+ * companion wrappers and every relative import reachable from them.
+ */
+export const collectExpectedRunCompanionAssetRelativePaths = (
+  rootDir: string
+): Effect.Effect<ReadonlyArray<string>, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const collected = new Set<string>();
+
+    for (const fileName of RUN_COMPANION_MODULE_FILENAMES) {
+      yield* collectRelativeImportPaths({
+        fs,
+        path,
+        rootDir,
+        relativePath: fileName,
+        collected,
+        recordMissingPaths: true,
+      });
+    }
+
+    return [...collected].sort();
+  });
+
+const DEFAULT_GITHUB_CONFIG = {
+  apiBaseUrl: 'https://api.github.com',
+  owner: 'ComposioHQ',
+  repo: 'composio',
+};
+
+const resolveBinaryAssetName = ({
+  platform = process.platform,
+  arch = process.arch,
+}: {
+  platform?: NodeJS.Platform;
+  arch?: string;
+}) => {
+  switch (`${platform}-${arch}`) {
+    case 'darwin-arm64':
+      return 'composio-darwin-aarch64.zip';
+    case 'darwin-x64':
+      return 'composio-darwin-x64.zip';
+    case 'linux-x64':
+      return 'composio-linux-x64.zip';
+    case 'linux-arm64':
+      return 'composio-linux-aarch64.zip';
+    default:
+      return undefined;
+  }
+};
+
+const readTextFileIfPresent = (fs: FileSystem.FileSystem, filePath: string) =>
+  Effect.gen(function* () {
+    const exists = yield* fileExists(fs, filePath);
+    if (!exists) {
+      return undefined;
+    }
+
+    const value = (yield* Effect.orDie(fs.readFileString(filePath, 'utf8'))).trim();
+    return value.length > 0 ? value : undefined;
+  });
+
+export const readInstalledReleaseTag = (
+  execPath: string
+): Effect.Effect<string | undefined, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    return yield* readTextFileIfPresent(
+      fs,
+      path.join(path.dirname(execPath), RUN_COMPANION_RELEASE_TAG_FILENAME)
+    );
+  });
+
+export const normalizeCliReleaseVersion = (releaseIdentifier: string): string => {
+  const trimmed = releaseIdentifier.trim();
+  if (trimmed.startsWith(CLI_RELEASE_TAG_PREFIX)) {
+    return trimmed.slice(CLI_RELEASE_TAG_PREFIX.length);
+  }
+  if (/^v\d+\.\d+\.\d+(?:[-+].*)?$/.test(trimmed)) {
+    return trimmed.slice(1);
+  }
+  return trimmed;
+};
+
+export const normalizeCliReleaseTag = (releaseIdentifier: string): string =>
+  `${CLI_RELEASE_TAG_PREFIX}${normalizeCliReleaseVersion(releaseIdentifier)}`;
+
+export const resolveInstalledCliVersion = (
+  execPath: string,
+  fallbackVersion: string
+): Effect.Effect<string, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.map(readInstalledReleaseTag(execPath), releaseTag =>
+    normalizeCliReleaseVersion(releaseTag ?? fallbackVersion)
+  );
+
+export const resolveInstalledCliReleaseTag = (
+  execPath: string,
+  fallbackVersion: string
+): Effect.Effect<string, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.map(readInstalledReleaseTag(execPath), releaseTag =>
+    normalizeCliReleaseTag(releaseTag ?? fallbackVersion)
+  );
+
+export const resolveRunningCliVersion = (
+  execPath: string,
+  appVersion: string,
+  isReleaseBuild = IS_RELEASE_BUILD
+): Effect.Effect<string, never, FileSystem.FileSystem | Path.Path> =>
+  isReleaseBuild
+    ? Effect.succeed(normalizeCliReleaseVersion(appVersion))
+    : resolveInstalledCliVersion(execPath, appVersion);
+
+export const resolveRunningCliReleaseTag = (
+  execPath: string,
+  appVersion: string,
+  isReleaseBuild = IS_RELEASE_BUILD
+): Effect.Effect<string, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.map(
+    resolveRunningCliVersion(execPath, appVersion, isReleaseBuild),
+    normalizeCliReleaseTag
+  );
+
+export const writeInstalledReleaseTag = (
+  installDir: string,
+  releaseTag: string
+): Effect.Effect<void, PlatformError.PlatformError, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    yield* fs.writeFileString(
+      path.join(installDir, RUN_COMPANION_RELEASE_TAG_FILENAME),
+      `${releaseTag}\n`
+    );
+  });
+
+/**
+ * The companion wrappers and their import graph, listed when missing.
+ *
+ * `composio run` preloads `run-helpers-runtime` into the spawned child, and the
+ * CLI loads the in-process ones on demand, so a missing one really is a broken
+ * install and justifies the self-repair download.
+ */
+export const listMissingInstalledRunCompanionModules = (
+  execPath: string
+): Effect.Effect<ReadonlyArray<string>, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const installDirectory = path.dirname(execPath);
+    const expectedRelativePaths =
+      yield* collectExpectedRunCompanionAssetRelativePaths(installDirectory);
+    return yield* Effect.filter(expectedRelativePaths, relativePath =>
+      Effect.map(fileExists(fs, path.join(installDirectory, relativePath)), exists => !exists)
+    );
+  });
+
+/**
+ * The files one companion needs next to the executable: its wrapper and every
+ * relative import reachable from it, listed when missing.
+ */
+const listMissingInstalledCompanionModuleFiles = (
+  execPath: string,
+  baseName: string
+): Effect.Effect<ReadonlyArray<string>, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const installDirectory = path.dirname(execPath);
+    const collected = new Set<string>();
+    yield* collectRelativeImportPaths({
+      fs,
+      path,
+      rootDir: installDirectory,
+      relativePath: `${baseName}.mjs`,
+      collected,
+      recordMissingPaths: true,
+    });
+    return yield* Effect.filter([...collected], relativePath =>
+      Effect.map(fileExists(fs, path.join(installDirectory, relativePath)), exists => !exists)
+    );
+  });
+
+const fetchGitHubJson = async <A, I>(
+  schema: Schema.Codec<A, I>,
+  {
+    url,
+    accessToken,
+    fetchErrorMessage,
+  }: {
+    url: string;
+    accessToken?: string;
+    fetchErrorMessage: string;
+  }
+): Promise<A> => {
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'composio-cli-run-repair',
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`${fetchErrorMessage} (HTTP ${response.status}${body ? `: ${body}` : ''})`);
+  }
+
+  return Schema.decodeUnknownPromise(schema)(await response.json());
+};
+
+const fetchChecksums = async ({
+  release,
+  accessToken,
+}: {
+  release: GitHubRelease;
+  accessToken?: string;
+}) => {
+  const checksumsAsset = release.assets.find(asset => asset.name === 'checksums.txt');
+  if (!checksumsAsset) {
+    return undefined;
+  }
+
+  const response = await fetch(checksumsAsset.browser_download_url, {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+
+  if (!response.ok) {
+    return undefined;
+  }
+
+  return parseChecksumsText(await response.text());
+};
+
+const verifyChecksum = async ({
+  data,
+  expectedHash,
+  fileName,
+}: {
+  data: Uint8Array;
+  expectedHash: string;
+  fileName: string;
+}) => {
+  const actualHash = await sha256Hex(data);
+
+  if (actualHash !== expectedHash) {
+    throw new Error(
+      `Checksum mismatch while repairing ${fileName}\n  Expected: ${expectedHash}\n  Actual:   ${actualHash}`
+    );
+  }
+};
+
+const toRepairError = (error: unknown) =>
+  new RunCompanionRepairError({
+    message: error instanceof Error ? error.message : String(error),
+    cause: error,
+  });
+
+// Self-repair honors the unprefixed GITHUB_* contract (set by CI and the binary
+// build workflow) first, then falls back to the
+// CLI-wide COMPOSIO_-prefixed spelling installed by cli-main's config provider.
+//
+// Built lazily (a function, not a memoized module-level constant): each
+// `getBaseConfigProvider()` call snapshots `process.env` at call time, so a
+// frozen constant would never observe env var changes made after this module
+// is first imported (e.g. `vi.stubEnv` in tests).
+const getRepairConfigProvider = (): ConfigProvider.ConfigProvider =>
+  getBaseConfigProvider().pipe(
+    ConfigProvider.orElse(extendConfigProvider(getBaseConfigProvider()))
+  );
+
+const resolveRepairReleaseTag = ({
+  execPath,
+  appVersion,
+}: {
+  execPath: string;
+  appVersion: string;
+}) =>
+  Effect.gen(function* () {
+    // GITHUB_TAG pins the release used for self-repair (set by the binary build workflow).
+    const pinnedTag = yield* Effect.orDie(
+      Config.option(Config.String('GITHUB_TAG')).pipe(
+        Config.map(tag => Option.getOrUndefined(Option.map(tag, value => value.trim())))
+      )
+    ).pipe(
+      Effect.provideServiceEffect(
+        ConfigProvider.ConfigProvider,
+        Effect.sync(() => getRepairConfigProvider())
+      )
+    );
+    if (pinnedTag) {
+      return pinnedTag;
+    }
+
+    return yield* resolveRunningCliReleaseTag(execPath, appVersion);
+  });
+
+const nonEmptyConfigWithFallback = (name: string, fallback: string) =>
+  Config.String(name).pipe(
+    Config.map(value => value || fallback),
+    Config.withDefault(fallback)
+  );
+
+// The GITHUB_* overrides let CI and forks redirect the self-repair download.
+const githubRepairConfig = Effect.orDie(
+  Effect.all({
+    apiBaseUrl: nonEmptyConfigWithFallback('GITHUB_API_BASE_URL', DEFAULT_GITHUB_CONFIG.apiBaseUrl),
+    owner: nonEmptyConfigWithFallback('GITHUB_OWNER', DEFAULT_GITHUB_CONFIG.owner),
+    repo: nonEmptyConfigWithFallback('GITHUB_REPO', DEFAULT_GITHUB_CONFIG.repo),
+    accessToken: Config.option(Config.String('GITHUB_ACCESS_TOKEN')).pipe(
+      Config.map(Option.getOrUndefined)
+    ),
+  })
+).pipe(
+  Effect.provideServiceEffect(
+    ConfigProvider.ConfigProvider,
+    Effect.sync(() => getRepairConfigProvider())
+  )
+);
+
+/**
+ * Restores a packaged install whose companion wrappers went missing, from the
+ * release archive of the running version. The archive's legacy placeholders are
+ * not companions and are left behind.
+ */
+export const repairMissingInstalledRunCompanionModules = ({
+  callerImportMetaUrl,
+  execPath,
+  appVersion,
+  companionBaseName,
+}: {
+  callerImportMetaUrl: string;
+  execPath: string;
+  appVersion: string;
+  /**
+   * Repair only when this companion's own files are missing, rather than when
+   * any companion file is. The repair still restores the full set.
+   */
+  companionBaseName?: string;
+}): Effect.Effect<
+  { readonly repaired: false } | { readonly repaired: true; readonly releaseTag: string },
+  RunCompanionRepairError | PlatformError.PlatformError,
+  FileSystem.FileSystem | Path.Path
+> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+
+    const currentFilePath = yield* filePathFromUrl(path, callerImportMetaUrl);
+    if (!currentFilePath.startsWith('/$bunfs/')) {
+      return { repaired: false as const };
+    }
+
+    const missingModules =
+      companionBaseName === undefined
+        ? yield* listMissingInstalledRunCompanionModules(execPath)
+        : yield* listMissingInstalledCompanionModuleFiles(execPath, companionBaseName);
+    if (missingModules.length === 0) {
+      return { repaired: false as const };
+    }
+
+    const releaseTag = yield* resolveRepairReleaseTag({ execPath, appVersion });
+    const githubConfig = yield* githubRepairConfig;
+
+    const encodedTag = encodeURIComponent(releaseTag);
+    const release = yield* Effect.tryPromise({
+      try: () =>
+        fetchGitHubJson(GitHubRelease, {
+          url: `${githubConfig.apiBaseUrl}/repos/${githubConfig.owner}/${githubConfig.repo}/releases/tags/${encodedTag}`,
+          accessToken: githubConfig.accessToken,
+          fetchErrorMessage: `Failed to fetch release metadata for ${releaseTag} while repairing run companion modules`,
+        }),
+      catch: error =>
+        new RunCompanionRepairError({
+          message: [
+            `Unable to restore the CLI's bundled support files for ${releaseTag}.`,
+            error instanceof Error ? error.message : String(error),
+            `Reinstall the CLI, or set GITHUB_TAG to the exact release tag for this build and try again.`,
+          ].join('\n'),
+          cause: error,
+        }),
+    });
+
+    const assetName = resolveBinaryAssetName({});
+    if (!assetName) {
+      return yield* Effect.fail(
+        new RunCompanionRepairError({
+          message: `Unsupported platform for run companion repair: ${process.platform}-${process.arch}`,
+        })
+      );
+    }
+
+    const asset = release.assets.find(candidate => candidate.name === assetName);
+    if (!asset) {
+      return yield* Effect.fail(
+        new RunCompanionRepairError({
+          message: `Release ${release.tag_name} does not contain ${assetName}; cannot restore run companion modules.`,
+        })
+      );
+    }
+
+    const archiveData = yield* Effect.tryPromise({
+      try: async () => {
+        const archiveResponse = await fetch(asset.browser_download_url, {
+          headers: githubConfig.accessToken
+            ? { Authorization: `Bearer ${githubConfig.accessToken}` }
+            : undefined,
+        });
+        if (!archiveResponse.ok) {
+          throw new Error(
+            `Failed to download ${asset.name} from ${release.tag_name} while repairing run companion modules (HTTP ${archiveResponse.status}).`
+          );
+        }
+        return new Uint8Array(await archiveResponse.arrayBuffer());
+      },
+      catch: toRepairError,
+    });
+
+    const checksums = yield* Effect.tryPromise({
+      try: () =>
+        fetchChecksums({
+          release,
+          accessToken: githubConfig.accessToken,
+        }),
+      catch: toRepairError,
+    });
+    const expectedChecksum = checksums?.get(asset.name);
+    if (expectedChecksum) {
+      yield* Effect.tryPromise({
+        try: () =>
+          verifyChecksum({
+            data: archiveData,
+            expectedHash: expectedChecksum,
+            fileName: asset.name,
+          }),
+        catch: toRepairError,
+      });
+    }
+
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const tempDirectory = yield* fs.makeTempDirectoryScoped({
+          prefix: 'composio-run-repair-',
+        });
+        const archivePath = path.join(tempDirectory, asset.name);
+        const extractDirectory = path.join(tempDirectory, 'extract');
+        const packageDirectory = path.join(extractDirectory, path.parse(asset.name).name);
+        yield* fs.writeFile(archivePath, archiveData);
+        yield* fs.makeDirectory(extractDirectory, { recursive: true });
+        yield* Effect.tryPromise({
+          try: () => extractZipSafely(archivePath, extractDirectory),
+          catch: toRepairError,
+        });
+
+        const installDirectory = path.dirname(execPath);
+        const companionRelativePaths =
+          yield* collectExpectedRunCompanionAssetRelativePaths(packageDirectory);
+
+        for (const relativePath of companionRelativePaths) {
+          const sourcePath = path.join(packageDirectory, relativePath);
+          const sourceExists = yield* fileExists(fs, sourcePath);
+          if (!sourceExists) {
+            return yield* Effect.fail(
+              new RunCompanionRepairError({
+                message: `Release ${release.tag_name} is missing ${relativePath}; cannot restore the CLI's bundled support files.`,
+              })
+            );
+          }
+
+          const targetPath = path.join(installDirectory, relativePath);
+          yield* fs.makeDirectory(path.dirname(targetPath), { recursive: true });
+          yield* atomicReplaceFile({ sourcePath, targetPath }).pipe(
+            Effect.mapError(
+              error =>
+                new RunCompanionRepairError({
+                  message: [
+                    `Unable to restore the CLI's bundled support files for ${releaseTag}.`,
+                    error.message,
+                    `Reinstall the CLI, or set GITHUB_TAG to the exact release tag for this build and try again.`,
+                  ].join('\n'),
+                  cause: error.cause,
+                })
+            )
+          );
+        }
+
+        yield* writeInstalledReleaseTag(installDirectory, release.tag_name);
+        return {
+          repaired: true as const,
+          releaseTag: release.tag_name,
+        };
+      })
+    );
+  });
+
+export const resolveRunCompanionModulePath = ({
+  callerImportMetaUrl,
+  execPath,
+  relativeNoExtensionFromCaller,
+}: {
+  callerImportMetaUrl: string;
+  execPath: string;
+  relativeNoExtensionFromCaller: string;
+}): Effect.Effect<string, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const currentFilePath = yield* filePathFromUrl(path, callerImportMetaUrl);
+    const currentDirectory = path.dirname(currentFilePath);
+    const executableDirectory = path.dirname(execPath);
+    const baseName = path.basename(relativeNoExtensionFromCaller);
+
+    const candidates = [
+      path.resolve(currentDirectory, `${relativeNoExtensionFromCaller}.ts`),
+      path.resolve(currentDirectory, `${relativeNoExtensionFromCaller}.js`),
+      path.resolve(currentDirectory, 'services', `${baseName}.mjs`),
+      path.resolve(currentDirectory, 'services', `${baseName}.js`),
+      path.resolve(currentDirectory, `${baseName}.mjs`),
+      path.resolve(currentDirectory, `${baseName}.js`),
+      path.resolve(executableDirectory, `${baseName}.mjs`),
+      path.resolve(executableDirectory, `${baseName}.js`),
+    ];
+
+    const found = yield* Effect.findFirst(candidates, candidate => fileExists(fs, candidate));
+    return Option.getOrElse(found, () =>
+      currentFilePath.startsWith('/$bunfs/')
+        ? path.resolve(executableDirectory, `${baseName}.mjs`)
+        : path.resolve(currentDirectory, `${baseName}.mjs`)
+    );
+  });
+
+/**
+ * Loads one of the in-process companion modules (see the note on
+ * `RUN_COMPANION_MODULE_BASENAMES`) and returns its exports.
+ *
+ * Resolution is the same as for the `run` companions: the `.ts` source next to
+ * this file when running from a checkout (tests, `bun run src/bin.ts`), the
+ * `.mjs` bundle next to the executable in a packaged install.
+ *
+ * A packaged install missing this module's own files goes through the
+ * release-archive repair `composio run` uses before the import. Files of other
+ * companions do not trigger it, so an offline repair failure cannot block a
+ * module that is already in place. The repair has to come first: Bun keeps a
+ * failed or already-loaded import in its module registry, so importing again
+ * after a repair can still see the old result.
+ *
+ * A module that loads but lacks one of `requiredExports` is a file left behind
+ * by a different release; it fails with a typed error asking for a reinstall.
+ *
+ * The specifier is computed at runtime on purpose: a literal `import('./x')`
+ * would make the bundler fold the module back into the executable, which is the
+ * exact thing these modules exist to avoid.
+ *
+ * `M` is the module's type; pass `typeof import('src/services/<name>')`, which
+ * is type-only and leaves no import behind.
+ */
+export const loadInstalledCompanionModule = <M>(
+  baseName: string,
+  requiredExports: ReadonlyArray<keyof M & string>
+): Effect.Effect<
+  M,
+  RunCompanionRepairError | PlatformError.PlatformError,
+  FileSystem.FileSystem | Path.Path
+> =>
+  Effect.gen(function* () {
+    const path = yield* Path.Path;
+    const callerImportMetaUrl = import.meta.url;
+    const execPath = process.execPath;
+
+    yield* repairMissingInstalledRunCompanionModules({
+      callerImportMetaUrl,
+      execPath,
+      appVersion: APP_VERSION,
+      companionBaseName: baseName,
+    });
+
+    const modulePath = yield* resolveRunCompanionModulePath({
+      callerImportMetaUrl,
+      execPath,
+      relativeNoExtensionFromCaller: `./${baseName}`,
+    });
+    const fileName = path.basename(modulePath);
+    const moduleUrl = yield* Effect.orDie(path.toFileUrl(modulePath));
+
+    // A rejected import means the file resolved above is missing or unloadable:
+    // a broken install. It stays a typed failure so callers can report it, or
+    // fall back, instead of crashing with a stack trace.
+    const exports = yield* Effect.tryPromise({
+      try: () => import(moduleUrl.href) as Promise<Record<string, unknown>>,
+      catch: cause =>
+        new RunCompanionRepairError({
+          message: `Unable to load the CLI's bundled support file ${fileName}. Reinstall the CLI and try again.`,
+          cause,
+        }),
+    });
+
+    const missingExports = requiredExports.filter(name => !(name in exports));
+    if (missingExports.length > 0) {
+      return yield* new RunCompanionRepairError({
+        message: `The CLI's bundled support file ${fileName} does not match this CLI (missing ${missingExports.join(', ')}). Reinstall the CLI and try again.`,
+      });
+    }
+    return exports as M;
+  });

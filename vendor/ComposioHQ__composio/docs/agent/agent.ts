@@ -1,0 +1,214 @@
+import { createOpenAI } from '@ai-sdk/openai';
+import { defineAgent } from 'eve';
+import type { AgentModelDefinition, AgentModelOptionsDefinition } from 'eve';
+import { z } from 'zod';
+
+const INCEPTION_BASE_URL = process.env.INCEPTION_BASE_URL ?? 'https://api.inceptionlabs.ai/v1';
+const INCEPTION_MODEL = process.env.INCEPTION_MODEL ?? 'mercury-2';
+const DOCS_AGENT_GATEWAY_MODEL = process.env.DOCS_AGENT_GATEWAY_MODEL ?? 'openai/gpt-5.4-mini';
+const DOCS_AGENT_MODEL_FLOW = process.env.DOCS_AGENT_MODEL_FLOW ?? 'mercury';
+
+type DocsAgentModelConfig = {
+  model: AgentModelDefinition;
+  modelContextWindowTokens?: number;
+  modelOptions?: AgentModelOptionsDefinition;
+};
+
+const resolveInceptionApiKey = () => {
+  const apiKey = process.env.INCEPTION_API_KEY;
+
+  if (!apiKey) {
+    throw new Error('INCEPTION_API_KEY is required to run the docs agent with Inception Mercury.');
+  }
+
+  return apiKey;
+};
+
+const INCEPTION_SAFE_ERROR_MESSAGE = 'Docs agent model request failed.';
+const INCEPTION_ERROR_RESPONSE_SCHEMA = z
+  .object({
+    error: z.object({}).passthrough(),
+  })
+  .passthrough();
+
+const ABORT_LIKE_ERROR_SCHEMA = z
+  .object({
+    name: z.enum(['AbortError', 'TimeoutError']),
+  })
+  .passthrough();
+
+const isAbortLikeError = (error: unknown) => ABORT_LIKE_ERROR_SCHEMA.safeParse(error).success;
+
+async function throwIfInceptionErrorPayload(response: Response): Promise<void> {
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+
+  if (!contentType.includes('application/json')) {
+    return;
+  }
+
+  const body = await response
+    .clone()
+    .json()
+    .catch(() => null);
+
+  if (INCEPTION_ERROR_RESPONSE_SCHEMA.safeParse(body).success) {
+    throw new Error(`${INCEPTION_SAFE_ERROR_MESSAGE} Upstream returned an error payload.`);
+  }
+}
+
+export async function safeInceptionFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${resolveInceptionApiKey()}`);
+
+  let response: Response;
+  try {
+    response = await fetch(input, { ...init, headers });
+  } catch (error) {
+    if (isAbortLikeError(error)) {
+      throw error;
+    }
+
+    throw new Error(INCEPTION_SAFE_ERROR_MESSAGE);
+  }
+
+  if (!response.ok) {
+    throw new Error(`${INCEPTION_SAFE_ERROR_MESSAGE} Upstream status: ${response.status}.`);
+  }
+
+  await throwIfInceptionErrorPayload(response);
+
+  return response;
+}
+
+const inception = createOpenAI({
+  name: 'inception',
+  baseURL: INCEPTION_BASE_URL,
+  // The OpenAI-compatible AI SDK provider otherwise falls back to OPENAI_API_KEY
+  // when apiKey is undefined. Keep the actual Mercury key runtime-resolved so we
+  // never accidentally send an OpenAI key to Inception's endpoint.
+  apiKey: 'runtime-resolved-by-inception-fetch',
+  fetch: safeInceptionFetch,
+});
+
+type InceptionChatModel = ReturnType<typeof inception.chat>;
+type InceptionStreamResult = Awaited<ReturnType<InceptionChatModel['doStream']>>;
+type InceptionStreamPart =
+  InceptionStreamResult['stream'] extends ReadableStream<infer Part> ? Part : never;
+
+// AI SDK provider errors carry `requestBodyValues`, which holds the chat payload
+// and therefore the system prompt. safeInceptionFetch cannot stop the ones the
+// provider builds itself (e.g. an error frame inside a 200 SSE stream).
+const sanitizeInceptionModelError = (error: unknown): unknown =>
+  isAbortLikeError(error) ? error : new Error(INCEPTION_SAFE_ERROR_MESSAGE);
+
+export function withSanitizedModelErrors(model: InceptionChatModel): InceptionChatModel {
+  return {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    modelId: model.modelId,
+    supportedUrls: model.supportedUrls,
+    async doGenerate(options) {
+      try {
+        return await model.doGenerate(options);
+      } catch (error) {
+        throw sanitizeInceptionModelError(error);
+      }
+    },
+    async doStream(options) {
+      let result: InceptionStreamResult;
+      try {
+        result = await model.doStream(options);
+      } catch (error) {
+        throw sanitizeInceptionModelError(error);
+      }
+
+      // Error parts that arrive after the first output chunk never pass through
+      // the provider's pre-output check, so sanitize the stream as well.
+      return {
+        ...result,
+        stream: result.stream.pipeThrough(
+          new TransformStream<InceptionStreamPart, InceptionStreamPart>({
+            transform(part, controller) {
+              controller.enqueue(
+                part.type === 'error'
+                  ? { type: 'error', error: sanitizeInceptionModelError(part.error) }
+                  : part
+              );
+            },
+          })
+        ),
+      };
+    },
+  };
+}
+
+export const createInceptionChatModel = (modelId: string = INCEPTION_MODEL): InceptionChatModel =>
+  withSanitizedModelErrors(inception.chat(modelId));
+
+const gatewayModel = (model: string): AgentModelDefinition => {
+  // Eve supports AI Gateway model id strings here. Cast until the published
+  // type catches up with the documented `defineAgent({ model: "provider/model" })`
+  // gateway path.
+  return model as unknown as AgentModelDefinition;
+};
+
+const resolveDocsAgentModel = (): DocsAgentModelConfig => {
+  switch (DOCS_AGENT_MODEL_FLOW) {
+    case 'gateway':
+      return {
+        model: gatewayModel(DOCS_AGENT_GATEWAY_MODEL),
+      };
+    case 'mercury':
+      return {
+        // Use the chat-completions path because Mercury exposes tool calling there.
+        model: createInceptionChatModel(),
+        // Mercury 2's chat context window is 128K tokens.
+        modelContextWindowTokens: 128_000,
+        modelOptions: {
+          providerOptions: {
+            openai: {
+              // Mercury supports tool calling and the OpenAI-compatible adapter
+              // maps this to `reasoning_effort`. `medium` is Inception's
+              // recommended default and is accepted by the AI SDK OpenAI provider
+              // schema.
+              reasoningEffort: 'medium',
+            },
+          },
+        },
+      };
+    default:
+      throw new Error(
+        `Unsupported DOCS_AGENT_MODEL_FLOW "${DOCS_AGENT_MODEL_FLOW}". Expected "mercury" or "gateway".`
+      );
+  }
+};
+
+const docsAgentModel = resolveDocsAgentModel();
+
+/**
+ * Eve — the Composio docs assistant.
+ *
+ * Runs inside the docs Next.js app (mounted via `withEve` in next.config.mjs)
+ * and answers questions grounded in the docs. The `search_docs` tool returns
+ * doc snippets and their URLs so Eve can cite and link specific pages.
+ *
+ * Model: defaults to Inception Labs Mercury 2 diffusion model through the
+ * OpenAI-compatible chat endpoint. Set `INCEPTION_API_KEY` locally and in the
+ * preview environment.
+ *
+ * Evaluation / A-B knobs:
+ *
+ * - `DOCS_AGENT_MODEL_FLOW=mercury` (default) uses Inception Mercury.
+ * - `DOCS_AGENT_MODEL_FLOW=gateway` uses the Vercel AI Gateway fallback.
+ * - `INCEPTION_MODEL` (default: `mercury-2`)
+ * - `INCEPTION_BASE_URL` (default: `https://api.inceptionlabs.ai/v1`)
+ * - `DOCS_AGENT_GATEWAY_MODEL` (default: `openai/gpt-5.4-mini`)
+ */
+export default defineAgent({
+  model: docsAgentModel.model,
+  modelContextWindowTokens: docsAgentModel.modelContextWindowTokens,
+  modelOptions: docsAgentModel.modelOptions,
+});

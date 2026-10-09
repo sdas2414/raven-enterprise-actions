@@ -1,0 +1,448 @@
+/**
+ * OpenAI Toolset
+ *
+ * Author: Musthaq Ahamad <musthaq@composio.dev>
+ * Legacy Reference: https://github.com/ComposioHQ/composio/blob/master/js/src/toolsets/openai.ts
+ *
+ * This provider provides a set of tools for interacting with OpenAI's ChatCompletions API.
+ *
+ * @packageDocumentation
+ * @module providers/openai
+ */
+import { OpenAI } from 'openai';
+import {
+  BaseNonAgenticProvider,
+  Tool,
+  ExecuteToolModifiers,
+  ExecuteToolFnOptions,
+  ToolCallExecutionTarget,
+  ToolCallSession,
+  McpUrlResponse,
+  normalizeToolArguments,
+  deduplicateJsonSchemaRequiredArrays,
+  omitNullToolArguments,
+  toStrictJsonSchema,
+  logger,
+} from '@composio/core';
+
+export type OpenAiTool = OpenAI.Responses.FunctionTool;
+
+/** Parameters emitted for a tool without input parameters under strict mode. */
+const EMPTY_OBJECT_SCHEMA = {
+  type: 'object',
+  properties: {},
+  required: [],
+  additionalProperties: false,
+} as const;
+export type OpenAiMcpTool = OpenAI.Responses.Tool.Mcp;
+export type OpenAiToolCollection = Array<OpenAiTool>;
+export type OpenAIResponsesProviderOptions = {
+  /**
+   * Whether to use strict mode for function calls
+   * @default false
+   */
+  strict?: boolean;
+};
+
+/**
+ * OpenAI-specific MCP server response format
+ */
+export class OpenAIResponsesProvider extends BaseNonAgenticProvider<
+  OpenAiToolCollection,
+  OpenAiTool,
+  OpenAiMcpTool[]
+> {
+  readonly name = 'openai';
+  private strict: boolean | null;
+  /**
+   * Parameter schemas of the tools wrapped under strict mode, keyed by slug,
+   * so tool-call arguments can be reconciled against the schema the model
+   * actually saw.
+   */
+  private readonly strictInputSchemas = new Map<string, Record<string, unknown>>();
+
+  /**
+   * Creates a new instance of the OpenAIProvider.
+   *
+   * This is the default provider for the Composio SDK and is automatically
+   * available without additional installation.
+   *
+   * @param {OpenAIResponsesProviderOptions} [options] - Optional provider options
+   * @returns {OpenAIResponsesProvider} The OpenAIResponsesProvider instance
+   *
+   * @example
+   * ```typescript
+   * // The OpenAIProvider is used by default when initializing Composio
+   * const composio = new Composio({
+   *   apiKey: 'your-api-key'
+   * });
+   *
+   * // You can also explicitly specify it
+   * const composio = new Composio({
+   *   apiKey: 'your-api-key',
+   *   provider: new OpenAIResponsesProvider({
+   *     strict: true // Optional, default is false
+   *   })
+   * });
+   * ```
+   */
+  constructor(options?: OpenAIResponsesProviderOptions) {
+    super();
+    this.strict = options?.strict ?? false;
+  }
+
+  /**
+   * Transform MCP URL response into OpenAI Responses-specific format.
+   * OpenAI Responses uses a custom format with type, server_label, server_url, and require_approval fields.
+   *
+   * @param data - The MCP URL response data
+   * @param serverName - Name of the MCP server
+   * @returns OpenAI-specific MCP server response format
+   */
+  override wrapMcpServerResponse(data: McpUrlResponse): OpenAiMcpTool[] {
+    logger.debug(
+      `Wrapping MCP server response for ${data.length} server(s): ${data.map(server => server.name).join(', ')}`
+    );
+    return data.map(item => ({
+      type: 'mcp',
+      server_label: item.name,
+      server_url: item.url,
+      require_approval: 'never',
+    }));
+  }
+
+  /**
+   * Wraps a Composio tool in the OpenAI function calling format.
+   *
+   * This method transforms a Composio tool definition into the format
+   * expected by OpenAI's function calling API.
+   *
+   * @param tool - The Composio tool to wrap
+   * @returns The wrapped tool in OpenAI format
+   *
+   * @example
+   * ```typescript
+   * // Wrap a single tool for use with OpenAI
+   * const composioTool = {
+   *   slug: 'SEARCH_TOOL',
+   *   description: 'Search for information',
+   *   inputParameters: {
+   *     type: 'object',
+   *     properties: {
+   *       query: { type: 'string' }
+   *     },
+   *     required: ['query']
+   *   }
+   * };
+   *
+   * const openAITool = provider.wrapTool(composioTool);
+   * ```
+   */
+  override wrapTool(tool: Tool): OpenAiTool {
+    const inputParams = tool.inputParameters;
+    if (!this.strict) {
+      return {
+        name: tool.slug,
+        description: tool.description,
+        // Canonicalize required arrays at the vendor-schema emission boundary.
+        parameters: deduplicateJsonSchemaRequiredArrays(
+          (inputParams ?? {}) as Record<string, unknown>
+        ),
+        strict: this.strict,
+        type: 'function',
+      };
+    }
+
+    // Structured outputs enforce their contract at every depth: all
+    // properties required, closed objects, no annotation keywords. The strict
+    // rewrite keeps every parameter (optional ones become nullable) and
+    // reports constructs it cannot express; such a tool is sent without
+    // strict mode rather than with a narrower schema.
+    const source = (inputParams ?? EMPTY_OBJECT_SCHEMA) as Record<string, unknown>;
+    const strict = toStrictJsonSchema(source);
+    if (strict.unsupported.length > 0) {
+      const reasons = strict.unsupported
+        .map(entry => `${entry.path || '<root>'}: ${entry.keyword} (${entry.detail})`)
+        .join('; ');
+      logger.warn(
+        `OpenAIResponsesProvider: tool "${tool.slug}" is sent without strict mode because its schema cannot be expressed as strict structured outputs: ${reasons}`
+      );
+      this.strictInputSchemas.delete(tool.slug);
+      return {
+        name: tool.slug,
+        description: tool.description,
+        parameters: deduplicateJsonSchemaRequiredArrays(source),
+        strict: false,
+        type: 'function',
+      };
+    }
+    if (strict.totalChanges > 0) {
+      logger.debug(
+        `OpenAIResponsesProvider: strict mode rewrote ${strict.totalChanges} node(s) of tool "${tool.slug}": ${strict.changes
+          .map(change => `${change.path}: ${change.reason}`)
+          .join('; ')}`
+      );
+    }
+    this.strictInputSchemas.set(tool.slug, strict.source);
+
+    return {
+      name: tool.slug,
+      description: tool.description,
+      parameters: strict.schema,
+      strict: true,
+      type: 'function',
+    };
+  }
+
+  /**
+   * Wraps multiple Composio tools in the OpenAI function calling format.
+   *
+   * This method transforms a list of Composio tools into the format
+   * expected by OpenAI's function calling API.
+   *
+   * @param tools - Array of Composio tools to wrap
+   * @returns Array of wrapped tools in OpenAI format
+   *
+   * @example
+   * ```typescript
+   * // Wrap multiple tools for use with OpenAI
+   * const composioTools = [
+   *   {
+   *     slug: 'SEARCH_TOOL',
+   *     description: 'Search for information',
+   *     inputParameters: {
+   *       type: 'object',
+   *       properties: {
+   *         query: { type: 'string' }
+   *       }
+   *     }
+   *   },
+   *   {
+   *     slug: 'WEATHER_TOOL',
+   *     description: 'Get weather information',
+   *     inputParameters: {
+   *       type: 'object',
+   *       properties: {
+   *         location: { type: 'string' }
+   *       }
+   *     }
+   *   }
+   * ];
+   *
+   * const openAITools = provider.wrapTools(composioTools);
+   * ```
+   */
+  override wrapTools = (tools: Tool[]): OpenAiToolCollection => {
+    return tools.map(tool => this.wrapTool(tool));
+  };
+
+  /**
+   * Executes a tool call from OpenAI's chat completion.
+   *
+   * This method processes a tool call from OpenAI's chat completion API,
+   * executes the corresponding Composio tool, and returns the result.
+   *
+   * @param {string | ToolCallSession} executionTarget - A user ID for direct tools or the session that produced session tools
+   * @param {OpenAI.ChatCompletionMessageToolCall} tool - The tool call from OpenAI
+   * @param {ExecuteToolFnOptions} [options] - Optional execution options
+   * @param {ExecuteToolModifiers} [modifiers] - Optional execution modifiers
+   * @returns {Promise<string>} The result of the tool call as a JSON string
+   *
+   * @example
+   * ```typescript
+   * // Execute a tool call from OpenAI
+   * const toolCall = {
+   *   id: 'call_abc123',
+   *   type: 'function',
+   *   function: {
+   *     name: 'SEARCH_TOOL',
+   *     arguments: '{"query":"composio documentation"}'
+   *   }
+   * };
+   *
+   * const result = await provider.executeToolCall(
+   *   'user123',
+   *   toolCall,
+   *   { connectedAccountId: 'conn_xyz456' }
+   * );
+   * console.log(JSON.parse(result));
+   * ```
+   */
+  async executeToolCall(
+    session: ToolCallSession,
+    tool: OpenAI.Responses.ResponseFunctionToolCall
+  ): Promise<string>;
+  async executeToolCall(
+    userId: string,
+    tool: OpenAI.Responses.ResponseFunctionToolCall,
+    options?: ExecuteToolFnOptions,
+    modifiers?: ExecuteToolModifiers
+  ): Promise<string>;
+  async executeToolCall(
+    executionTarget: ToolCallExecutionTarget,
+    tool: OpenAI.Responses.ResponseFunctionToolCall,
+    options?: ExecuteToolFnOptions,
+    modifiers?: ExecuteToolModifiers
+  ): Promise<string> {
+    // OpenAI always serializes tool arguments as a JSON string; normalize tolerates
+    // empty / object-shaped payloads too (issue #2406).
+    const normalizedArguments = normalizeToolArguments(tool.arguments, tool.name);
+    // Under strict mode optional parameters are emitted as required-nullable,
+    // so a `null` the tool's own schema does not accept means "omitted".
+    const strictSchema = this.strictInputSchemas.get(tool.name);
+    const arguments_ = strictSchema
+      ? omitNullToolArguments(normalizedArguments, strictSchema)
+      : normalizedArguments;
+    const result = await this.executeToolForTarget(
+      executionTarget,
+      tool.name,
+      arguments_,
+      options,
+      modifiers
+    );
+    return JSON.stringify(result);
+  }
+
+  /**
+   * Handles tool calls from OpenAI's response.
+   *
+   * This method processes tool calls from an OpenAI response,
+   * executes each tool call, and returns the results.
+   *
+   * @param {string | ToolCallSession} executionTarget - A user ID for direct tools or the session that produced session tools
+   * @param {OpenAI.ChatCompletion} chatCompletion - The response from OpenAI
+   * @param {ExecuteToolFnOptions} [options] - Optional execution options
+   * @param {ExecuteToolModifiers} [modifiers] - Optional execution modifiers
+   * @returns {Promise<string[]>} Array of tool execution results as JSON strings
+   *
+   * @example
+   * ```typescript
+   * // Handle tool calls from a response
+   * const response = await openai.responses.create({
+   *   model: 'gpt-4o-2024-11-20',
+   *   input: 'What is the capital of France?',
+   *   tools: await composio.tools.get(composioTools)
+   * });
+   *
+   * const inputItems = await composio.provider.handleToolCalls(
+   *   'user123',
+   *   response.output
+   * );
+   * console.log(inputItems); // Array of tool execution results
+   *
+   * // Submit tool outputs back to OpenAI
+   * const response = await openai.responses.create({
+   *   model: 'gpt-4o-2024-11-20',
+   *   input: inputItems,
+   *   tools: await composio.tools.get(composioTools),
+   * });
+   * ```
+   * ```
+   */
+  async handleToolCalls(
+    session: ToolCallSession,
+    toolCalls: OpenAI.Responses.ResponseOutputItem[]
+  ): Promise<OpenAI.Responses.ResponseInputItem.FunctionCallOutput[]>;
+  async handleToolCalls(
+    userId: string,
+    toolCalls: OpenAI.Responses.ResponseOutputItem[],
+    options?: ExecuteToolFnOptions,
+    modifiers?: ExecuteToolModifiers
+  ): Promise<OpenAI.Responses.ResponseInputItem.FunctionCallOutput[]>;
+  async handleToolCalls(
+    executionTarget: ToolCallExecutionTarget,
+    toolCalls: OpenAI.Responses.ResponseOutputItem[],
+    options?: ExecuteToolFnOptions,
+    modifiers?: ExecuteToolModifiers
+  ): Promise<OpenAI.Responses.ResponseInputItem.FunctionCallOutput[]> {
+    this.assertToolCallExecutionOptions(executionTarget, options, modifiers);
+    const toolOutputs: OpenAI.Responses.ResponseInputItem.FunctionCallOutput[] = [];
+    for (const output of toolCalls) {
+      if (output.type === 'function_call') {
+        const tool_call = {
+          id: output.id,
+          name: output.name,
+          arguments: output.arguments,
+        } as OpenAI.Responses.ResponseFunctionToolCall;
+        try {
+          const toolOutput =
+            typeof executionTarget === 'string'
+              ? await this.executeToolCall(executionTarget, tool_call, options, modifiers)
+              : await this.executeToolCall(executionTarget, tool_call);
+          toolOutputs.push({
+            call_id: output.call_id ?? '',
+            type: 'function_call_output',
+            output: toolOutput,
+            // id: output.id ?? '',
+            status: 'completed',
+          });
+        } catch (error) {
+          toolOutputs.push({
+            call_id: output.call_id ?? '',
+            type: 'function_call_output',
+            output: error instanceof Error ? error.message : 'Unknown error',
+            // id: output.id ?? '',
+            status: 'incomplete',
+          });
+        }
+      }
+    }
+    return toolOutputs;
+  }
+
+  /**
+   * Handles all the tool calls from the OpenAI Responses API.
+   *
+   * This method processes tool calls from an OpenAI Responses request,
+   * executes each tool call, and returns the tool outputs for submission.
+   *
+   * @param {string | ToolCallSession} executionTarget - A user ID for direct tools or the session that produced session tools
+   * @param {OpenAI.Responses.Response} response - The Responses request object containing tool calls
+   * @param {ExecuteToolFnOptions} [options] - Optional execution options
+   * @param {ExecuteToolModifiers} [modifiers] - Optional execution modifiers
+   * @returns {Promise<OpenAI.Responses.ResponseInputItem.FunctionCallOutput[]>} Tool outputs to send back as Responses input items
+   *
+   * @example
+   * ```typescript
+   * // Handle tool calls from an OpenAI response
+   * const response = await openai.responses.create({
+   *   model: 'gpt-4o-2024-11-20',
+   *   input: 'What is the capital of France?',
+   *   tools: await composio.tools.get(composioTools),
+   *   tool_choice: 'auto',
+   * });
+   *
+   * const inputItems = await composio.provider.handleResponse('default', response);
+   *
+   * // Submit tool outputs back to OpenAI
+   * const response = await openai.responses.create({
+   *   model: 'gpt-4o-2024-11-20',
+   *   input: inputItems,
+   *   tools: await composio.tools.get(composioTools),
+   * });
+   * ```
+   */
+  async handleResponse(
+    session: ToolCallSession,
+    response: OpenAI.Responses.Response
+  ): Promise<OpenAI.Responses.ResponseInputItem.FunctionCallOutput[]>;
+  async handleResponse(
+    userId: string,
+    response: OpenAI.Responses.Response,
+    options?: ExecuteToolFnOptions,
+    modifiers?: ExecuteToolModifiers
+  ): Promise<OpenAI.Responses.ResponseInputItem.FunctionCallOutput[]>;
+  async handleResponse(
+    executionTarget: ToolCallExecutionTarget,
+    response: OpenAI.Responses.Response,
+    options?: ExecuteToolFnOptions,
+    modifiers?: ExecuteToolModifiers
+  ): Promise<OpenAI.Responses.ResponseInputItem.FunctionCallOutput[]> {
+    const tool_calls = response.output?.filter(output => output.type === 'function_call') || [];
+    if (typeof executionTarget === 'string') {
+      return this.handleToolCalls(executionTarget, tool_calls, options, modifiers);
+    }
+    this.assertToolCallExecutionOptions(executionTarget, options, modifiers);
+    return this.handleToolCalls(executionTarget, tool_calls);
+  }
+}

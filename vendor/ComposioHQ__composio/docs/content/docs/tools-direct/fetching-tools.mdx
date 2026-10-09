@@ -1,0 +1,264 @@
+---
+title: Fetching tools and schemas
+description: Fetch and filter tools, and inspect schemas
+keywords: [get tools, list tools, filter, schema]
+llmGuardrails: "direct-execution"
+legacy: true
+---
+
+<Callout type="info" title="Legacy API: prefer sessions">
+This guide covers legacy direct-execution methods, which remain supported for existing integrations. For new integrations, use [sessions](/docs/configuring-sessions) to discover and fetch tools at runtime. If you need a fixed tool set, consider the [direct tools preset](/docs/configuring-sessions#direct-tools-preset). See [Sessions vs direct execution](/docs/sessions-vs-direct-execution) and the [migration guide](/docs/migration-guide/direct-to-sessions).
+</Callout>
+
+Fetch specific tools, filter by permissions or search, and inspect schemas for type information. Tools are automatically formatted for your provider.
+
+Not sure which toolkit covers your use case? Browse the [Toolkits catalog](/toolkits) — each toolkit page lists its tool slugs — or [search by task](#by-search-experimental) below.
+
+## Basic usage
+
+<Tabs groupId="language" items={['Python', 'TypeScript']} persist>
+  <Tab value="Python">
+```python
+tools = composio.tools.get(
+    user_id,
+    toolkits=["GITHUB"]
+)
+```
+  </Tab>
+  <Tab value="TypeScript">
+```typescript
+import { Composio } from '@composio/core';
+const composio = new Composio({ apiKey: 'your_api_key' });
+const userId = 'user-123';
+// ---cut---
+const tools = await composio.tools.get(userId, {
+  toolkits: ["GITHUB"]
+});
+```
+  </Tab>
+</Tabs>
+
+Returns up to 20 tools by default. Tools require a `user_id` because they're scoped to authenticated accounts. See [User scoping](/docs/how-composio-works) and [Authentication](/docs/tools-direct/authenticating-tools).
+
+## Tool schemas
+
+Inspect tool parameters and types without a user_id:
+
+<Tabs groupId="language" items={['Python', 'TypeScript']} persist>
+  <Tab value="Python">
+```python
+tool = composio.tools.get_raw_composio_tool_by_slug("GMAIL_SEND_EMAIL")
+```
+  </Tab>
+  <Tab value="TypeScript">
+```typescript
+import { Composio } from '@composio/core';
+const composio = new Composio({ apiKey: 'your_api_key' });
+// ---cut---
+const tool = await composio.tools.getRawComposioToolBySlug("GMAIL_SEND_EMAIL");
+```
+  </Tab>
+</Tabs>
+
+Generate type-safe code for direct SDK execution with [`composio generate`](/docs/cli#generate-type-definitions). This creates TypeScript or Python types from tool schemas.
+
+<Callout type="info">
+View tool parameters and schemas visually in the [Composio platform](https://dashboard.composio.dev?utm_source=docs&utm_medium=content&utm_campaign=docs-tools-direct-fetching-tools). Navigate to any toolkit and select a tool to see its input/output parameters.
+</Callout>
+
+## Filtering tools
+
+### By toolkit
+
+Get tools from specific apps. Returns up to 20 tools by default.
+
+`limit` caps the number of returned tools. It does not select the tools needed for a task or guarantee relevance order. A small limit can exclude the tool you need. For a fixed workflow, [fetch explicit tool names](#by-name).
+
+<Callout type="info" title="TypeScript: limit and important tools">
+When you filter only by toolkit, the TypeScript SDK automatically requests tools marked `important` unless you set `important: false`. Supplying `limit`, `search`, or `tags` disables that automatic filter. To keep the important subset with a limit, pass `important: true` explicitly. The Python SDK does not expose this option.
+</Callout>
+
+<Tabs groupId="language" items={['Python', 'TypeScript']} persist>
+  <Tab value="Python">
+```python
+# Fetch with limit for a specific user
+tools = composio.tools.get(
+    user_id,
+    toolkits=["GITHUB"],
+    limit=5  # Return at most 5 tools
+)
+
+# Same filter but without user_id (for schemas)
+raw_tools = composio.tools.get_raw_composio_tools(
+    toolkits=["GITHUB"],
+    limit=5
+)
+```
+  </Tab>
+  <Tab value="TypeScript">
+```typescript
+import { Composio } from '@composio/core';
+const composio = new Composio({ apiKey: 'your_api_key' });
+const userId = 'user-123';
+// ---cut---
+// Fetch with limit for a specific user
+const limitedTools = await composio.tools.get(userId, {
+  toolkits: ["GITHUB"],
+  important: true,
+  limit: 5  // Return at most 5 important tools
+});
+
+// Same filter but without userId (for schemas)
+const rawTools = await composio.tools.getRawComposioTools({
+  toolkits: ["GITHUB"],
+  important: true,
+  limit: 5
+});
+```
+  </Tab>
+</Tabs>
+
+### By name
+
+Fetch specific tools when you know their names.
+
+<Tabs groupId="language" items={['Python', 'TypeScript']} persist>
+  <Tab value="Python">
+```python
+# Fetch specific tools by name
+tools = composio.tools.get(
+    user_id,
+    tools=["GITHUB_CREATE_ISSUE", "GITHUB_CREATE_PULL_REQUEST"]
+)
+
+# Get schemas without user_id
+raw_tools = composio.tools.get_raw_composio_tools(
+    tools=["GITHUB_CREATE_ISSUE", "GITHUB_CREATE_PULL_REQUEST"]
+)
+```
+  </Tab>
+  <Tab value="TypeScript">
+```typescript
+import { Composio } from '@composio/core';
+const composio = new Composio({ apiKey: 'your_api_key' });
+const userId = 'user-123';
+// ---cut---
+// Fetch specific tools by name
+const specificTools = await composio.tools.get(userId, {
+  tools: ["GITHUB_LIST_STARGAZERS", "GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER"]
+});
+
+// Get schemas without userId
+const specificRawTools = await composio.tools.getRawComposioTools({
+  tools: ["GITHUB_LIST_STARGAZERS", "GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER"]
+});
+```
+  </Tab>
+</Tabs>
+
+### By scopes
+
+Filter OAuth tools by permission level. Only works with a single toolkit.
+
+<Tabs groupId="language" items={['Python', 'TypeScript']} persist>
+  <Tab value="Python">
+```python
+# Filter by OAuth scopes (single toolkit only)
+tools = composio.tools.get(
+    user_id,
+    toolkits=["GITHUB"],
+    scopes=["write:org"]
+)
+```
+  </Tab>
+  <Tab value="TypeScript">
+```typescript
+import { Composio } from '@composio/core';
+const composio = new Composio({ apiKey: 'your_api_key' });
+const userId = 'user-123';
+// ---cut---
+// Filter by OAuth scopes (single toolkit only)
+const scopedTools = await composio.tools.get(userId, {
+  toolkits: ["GITHUB"],
+  scopes: ["write:org"]
+});
+```
+  </Tab>
+</Tabs>
+
+### By search (experimental)
+
+Search for tools with the `search` option. Start with short action keywords such as `create event`, `free busy`, or `send email`, and narrow the query with `toolkits` when you know the app.
+
+Inspect the returned descriptions and input schemas before selecting a tool. Do not assume the first result is the best match or that a natural-language goal returns every relevant tool. If you get no results, shorten the query or [fetch a known tool by name](#by-name).
+
+<Tabs groupId="language" items={['Python', 'TypeScript']} persist>
+  <Tab value="Python">
+```python
+# Search tools by action keywords
+tools = composio.tools.get(
+    user_id,
+    search="create event",
+    toolkits=["googlecalendar"]
+)
+
+# Search schemas without user_id
+raw_tools = composio.tools.get_raw_composio_tools(
+    search="create event",
+    toolkits=["googlecalendar"]
+)
+
+# Search within a specific toolkit
+tools = composio.tools.get(
+    user_id,
+    search="issues",
+    toolkits=["GITHUB"],
+)
+
+# Search toolkit schemas without user_id
+raw_tools = composio.tools.get_raw_composio_tools(
+    search="issues",
+    toolkits=["GITHUB"]
+)
+```
+  </Tab>
+  <Tab value="TypeScript">
+```typescript
+import { Composio } from '@composio/core';
+const composio = new Composio({ apiKey: 'your_api_key' });
+const userId = 'user-123';
+// ---cut---
+// Search tools by action keywords
+const searchResults = await composio.tools.get(userId, {
+  search: "create event",
+  toolkits: ["googlecalendar"]
+});
+
+// Search schemas without userId
+const searchRawTools = await composio.tools.getRawComposioTools({
+  search: "create event",
+  toolkits: ["googlecalendar"]
+});
+
+// Search within a specific toolkit
+const toolkitSearch = await composio.tools.get(userId, {
+  search: "star a repository",
+  toolkits: ["GITHUB"]
+});
+
+// Search toolkit schemas without userId
+const toolkitSearchRaw = await composio.tools.getRawComposioTools({
+  search: "star a repository",
+  toolkits: ["GITHUB"]
+});
+```
+  </Tab>
+</Tabs>
+
+<Callout type="info">
+These SDK examples use `latest` by default. REST v3 tool endpoints default to `00000000_00`; REST v3.1 tool endpoints default to `latest`. Pin a dated version when application code parses tool output. See [toolkit versioning](/docs/tools-direct/toolkit-versioning).
+</Callout>
+
+## Next
+
+<Card icon={<Play />} title="Executing tools" href="/docs/tools-direct/executing-tools" description="Run tools with providers, agentic frameworks, or direct execution" />
