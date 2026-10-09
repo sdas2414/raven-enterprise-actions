@@ -11,6 +11,9 @@ Source snapshots of 42 open-source repos saved from TikTok research (2026-10-08)
 - AGPL-3.0 (`FinceptTerminal`, `skyvern`, `OpenMontage`): if you run a modified version as a network service, you must publish your modifications.
 - `prediction-market-agent` is LGPL.
 
+**Snapshot gaps**
+- `heygen-com__hyperframes`: 171 Git LFS files (~586 MB of test videos/images) are omitted and listed in its `LFS_FILES_OMITTED.md`. Its LFS rules were removed from `.gitattributes` (original kept as `.gitattributes.orig-upstream`).
+
 ## Robinhood Agent
 
 | Repo | Role | License | Commit | Size | Saved from |
